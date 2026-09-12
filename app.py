@@ -150,28 +150,30 @@ PAGE = """<!DOCTYPE html>
 <meta name="theme-color" content="#0c0c0e">
 <title>PAPU-LAN · SDLG · Red local</title>
 <style>
-:root{--bg:#0c0c0e;--card:#141114;--acc:#FFDF00;--acc2:#D40000;--txt:#F5F2EA;--mut:#B8B2A7;--r:10px}
+:root{--bg:#0c0c0e;--card:#141114;--acc:#FFDF00;--acc2:#D40000;--txt:#F5F2EA;--mut:#B8B2A7;--r:14px}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html{-webkit-text-size-adjust:100%}
-body{background:var(--bg);color:var(--txt);font-family:Arial,Helvetica,sans-serif;min-height:100dvh;font-size:16px;line-height:1.45;touch-action:manipulation;padding-bottom:env(safe-area-inset-bottom)}
+body{background:var(--bg);color:var(--txt);font-family:Arial,Helvetica,sans-serif;min-height:100dvh;font-size:16px;line-height:1.55;touch-action:manipulation;padding-bottom:env(safe-area-inset-bottom)}
 h1,h2,.varsity{font-family:"Arial Black",Impact,Haettenschweiler,"Arial Narrow Bold",Arial,sans-serif;letter-spacing:.5px}
-header{position:sticky;top:0;z-index:10;background:#000;border-bottom:4px solid var(--acc2);padding:10px 14px;padding-top:calc(10px + env(safe-area-inset-top));display:flex;align-items:center;gap:10px}
-.escudo{width:46px;height:46px;flex:none;border-radius:8px;border:2px solid var(--acc2);background:#000}
-.t{flex:1;min-width:0}.t h1{font-size:22px;color:var(--acc);text-shadow:2px 2px 0 #000,-1px -1px 0 #000}.t p{color:#fff;background:var(--acc2);display:inline-block;font-size:11px;font-weight:700;padding:2px 8px;margin-top:2px;letter-spacing:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+header{position:sticky;top:0;z-index:10;background:#000;border-bottom:4px solid var(--acc2);padding:12px 16px;padding-top:calc(12px + env(safe-area-inset-top));display:flex;align-items:center;gap:12px}
+.escudo{width:52px;height:52px;flex:none;border-radius:10px;border:2px solid var(--acc2);background:#000}
+.t{flex:1;min-width:0}.t h1{font-size:22px;color:var(--acc);text-shadow:2px 2px 0 #000,-1px -1px 0 #000}.t p{color:#fff;background:var(--acc2);display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;margin-top:3px;letter-spacing:.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
 .badge{background:var(--acc2);color:#fff;border:2px solid #000;padding:6px 10px;border-radius:6px;font-size:12px;font-weight:700;white-space:nowrap;font-family:"Arial Black",Arial,sans-serif}
-main{max-width:960px;margin:0 auto;padding:12px;display:grid;gap:12px}
-.card{background:var(--card);border:2px solid var(--acc2);border-radius:var(--r);padding:14px}
-.card h2{font-size:15px;margin-bottom:10px;color:var(--acc)}
-.conn{background:#000;border:2px dashed var(--acc);border-radius:8px;padding:12px;font-size:15px;margin-bottom:10px;word-break:break-all}
+main{max-width:960px;margin:0 auto;padding:16px;display:grid;gap:16px}
+.card{background:var(--card);border:2px solid var(--acc2);border-radius:var(--r);padding:22px 18px}
+.card h2{font-size:17px;margin-bottom:14px;padding-bottom:10px;border-bottom:2px solid var(--acc2);color:var(--acc)}
+.card h2 span{font-size:12px;display:block;margin-top:6px;font-family:Arial,Helvetica,sans-serif;letter-spacing:0}
+.conn{background:#000;border:2px dashed var(--acc);border-radius:8px;padding:14px;font-size:15px;line-height:1.6;margin-bottom:12px;word-break:break-all}
 .conn b{color:var(--acc)}
-.copy{width:100%;margin-top:8px}
-.grid2{display:grid;grid-template-columns:1fr;gap:12px}
-input,textarea{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);border-radius:6px;padding:13px;font-size:16px;font-family:Arial,Helvetica,sans-serif}
+.copy{width:100%;margin-top:10px}
+.grid2{display:grid;grid-template-columns:1fr;gap:16px}
+label{display:block;margin:14px 0 2px;font-weight:700;font-size:14px}
+input,textarea{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);border-radius:8px;padding:14px;font-size:16px;font-family:Arial,Helvetica,sans-serif}
 textarea{resize:vertical;min-height:80px}
-button{background:linear-gradient(180deg,#E30613,#8F0000);color:#fff;border:3px solid #000;border-radius:8px;padding:13px 16px;min-height:48px;font-weight:900;cursor:pointer;font-size:15px;width:100%;font-family:"Arial Black",Arial,sans-serif;letter-spacing:.5px}
+button{background:linear-gradient(180deg,#E30613,#8F0000);color:#fff;border:3px solid #000;border-radius:10px;padding:15px 16px;min-height:52px;font-weight:900;cursor:pointer;font-size:15px;width:100%;font-family:"Arial Black",Arial,sans-serif;letter-spacing:.5px}
 button.ghost{background:#000;color:var(--acc);border:2px solid var(--acc2)}button.danger{background:#3a0000;color:#ff8080;width:auto;min-height:44px;padding:10px 14px;border:2px solid #000}
 button:active{transform:scale(.98)}
-.row{display:flex;gap:8px;margin-top:10px;flex-direction:column}
+.row{display:flex;gap:10px;margin-top:12px;flex-direction:column}
 .fila{display:grid;grid-template-columns:36px 1fr;gap:4px 10px;padding:12px;border:2px solid #4a4a4a;border-radius:8px;margin-bottom:8px;font-size:15px;background:#000}
 .fila .ico{font-size:22px;grid-row:span 2}
 .fila .n{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
@@ -180,27 +182,27 @@ button:active{transform:scale(.98)}
 .fila .acc a{flex:1;text-align:center;background:var(--acc);color:#000;font-family:"Arial Black",Arial,sans-serif;text-decoration:none;border:3px solid #000;border-radius:8px;padding:12px;min-height:48px;display:flex;align-items:center;justify-content:center}
 .msg{border-left:4px solid var(--acc2);background:#000;padding:10px 12px;border-radius:0 8px 8px 0;margin-bottom:8px}
 .msg .m{font-size:12px;color:var(--mut)}.msg .t{font-size:15px;margin-top:2px;word-break:break-word}
-footer{text-align:center;color:var(--mut);font-size:12px;padding:16px}
+footer{text-align:center;color:var(--mut);font-size:12px;line-height:1.7;padding:24px 16px}
 #drop{border:2px dashed var(--acc2);border-radius:10px;padding:20px;text-align:center;color:var(--mut);font-size:14px;margin-bottom:10px}
 #drop.over{border-color:var(--acc);color:var(--acc)}
 @media(hover:none){#drop{display:none}}
-@media(min-width:760px){main{padding:20px;gap:18px}.grid2{grid-template-columns:1fr 1fr;gap:18px}button{width:auto}.row{flex-direction:row}.fila{display:flex;align-items:center;background:none;border:none;border-bottom:1px solid #4a4a4a;border-radius:0;padding:10px;margin:0}.fila .acc{display:contents}.fila .acc a{flex:none;padding:8px 14px;min-height:0}.t p{white-space:normal}}
+@media(min-width:760px){main{padding:24px;gap:20px}.grid2{grid-template-columns:1fr 1fr;gap:20px}.card{padding:24px}button{width:auto}.row{flex-direction:row}.off .btns{flex-direction:row}.fila{display:flex;align-items:center;background:none;border:none;border-bottom:1px solid #4a4a4a;border-radius:0;padding:10px;margin:0}.fila .acc{display:contents}.fila .acc a{flex:none;padding:8px 14px;min-height:0}.t p{white-space:normal}}
 #login{position:fixed;inset:0;z-index:50;background:rgba(0,0,0,.96);display:flex;align-items:center;justify-content:center;padding:20px}
-#login .box{background:#0a0a0a;border:3px solid var(--acc2);border-radius:12px;padding:22px;width:100%;max-width:380px;text-align:center}
+#login .box{background:#0a0a0a;border:3px solid var(--acc2);border-radius:12px;padding:28px 24px;width:100%;max-width:380px;text-align:center}
 #login .box .escudo-big{width:110px;height:110px;border-radius:12px;border:3px solid var(--acc2);background:#000}
 #login .box h2{margin-bottom:6px}#login .box p{color:var(--mut);font-size:13px;margin-bottom:12px}
-#login input{margin-bottom:10px}
-.me{display:flex;align-items:center;gap:8px;background:#000;border:2px solid var(--acc2);border-radius:10px;padding:8px 12px;font-size:14px;margin-bottom:10px}
+#login input{margin-bottom:12px}
+.me{display:flex;align-items:center;gap:10px;background:#000;border:2px solid var(--acc2);border-radius:10px;padding:10px 14px;font-size:14px;margin-bottom:12px}
 .me button{width:auto;min-height:0;padding:6px 12px;font-size:13px}
-.off{border:2px solid #4a4a4a;border-radius:8px;padding:12px;margin-bottom:8px;background:#000}
+.off{border:2px solid #4a4a4a;border-radius:10px;padding:16px;margin-bottom:12px;background:#000}
 .off.pend{border-color:var(--acc)}.off.ok{border-color:var(--acc)}.off.no{opacity:.75}
-.off .t2{font-size:15px;font-weight:700}.off .d{font-size:12px;color:var(--mut);margin:2px 0 8px}
-.off .btns{display:flex;gap:8px}.off .btns button{flex:1}
+.off .t2{font-size:16px;font-weight:700}.off .d{font-size:13px;color:var(--mut);margin:4px 0 14px;line-height:1.5}
+.off .btns{display:flex;gap:10px;flex-direction:column}.off .btns button{flex:1}
 .usr{display:flex;align-items:center;gap:10px;padding:10px;border-bottom:1px solid var(--acc2);font-size:15px}
 .usr:last-child{border:none}.usr .dot{width:10px;height:10px;border-radius:50%;background:#475569}.usr .dot.on{background:#4ade80}
 .usr small{color:var(--mut)}
-select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);border-radius:6px;padding:13px;font-size:16px;font-family:Arial,Helvetica,sans-serif}
-.pacstrip{display:flex;align-items:center;gap:8px;background:#000;border:2px solid var(--acc2);border-radius:8px;padding:6px 12px;margin-bottom:10px;overflow:hidden}
+select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);border-radius:8px;padding:14px;font-size:16px;font-family:Arial,Helvetica,sans-serif}
+.pacstrip{display:flex;align-items:center;gap:10px;background:#000;border:2px solid var(--acc2);border-radius:10px;padding:10px 14px;margin-bottom:12px;overflow:hidden}
 .pacman{width:0;height:0;flex:none;border-top:13px solid #FFE600;border-bottom:13px solid #FFE600;border-left:13px solid #FFE600;border-right:13px solid transparent;border-radius:50%;animation:muerde .32s infinite alternate}
 @keyframes muerde{from{transform:rotate(-18deg)}to{transform:rotate(18deg)}}
 .coco{width:8px;height:8px;flex:none;border-radius:50%;background:#fff;box-shadow:0 0 6px #fff;animation:avanza 1.1s infinite linear}
@@ -212,7 +214,7 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 <body>
 <header>
 <div class="logo"><img class="escudo" src="/logo.png" alt="SDLG"></div>
-<div class="t"><h1>PAPU-LAN</h1><p>SEGUIDORES DE LA GRASA · SDLG</p></div>
+<div class="t"><h1>PAPU-LAN</h1><p>SEGUIDORES DE LA GRASA</p></div>
 <div class="badge">EN LINEA</div>
 </header>
 <div id="login"><div class="box">

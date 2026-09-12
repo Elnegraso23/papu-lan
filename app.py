@@ -27,7 +27,7 @@ USERS_FILE = DATA / "usuarios.json"
 OFFERS_FILE = DATA / "peticiones.json"
 FILES_META = DATA / "archivos.json"
 MAX_MSG = 200
-ONLINE_SECS = 45
+ONLINE_SECS = 15
 # Límites de transferencia entre usuarios
 MAX_FILE_MB = 100            # tamaño máximo por archivo
 MAX_FILES_PER_USER = 10      # archivos máximos subidos por usuario
@@ -252,10 +252,6 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 </div>
 <div class="card"><h2>PETICIONES PARA TI <span style="font-size:12px;color:var(--mut)">(acepta para iniciar la transferencia)</span></h2><div id="inbox">—</div></div>
 <div class="card"><h2>TUS PETICIONES ENVIADAS</h2><div id="outbox">—</div></div>
-<div class="card"><h2>TABLON DE MENSAJES</h2>
-<textarea id="texto" placeholder="Aviso, datos, enlace…" maxlength="1000"></textarea>
-<div class="row"><button onclick="enviarMsg()">PUBLICAR</button><button class="ghost" onclick="cargarTodo()">ACTUALIZAR</button></div>
-<div id="msgs" style="margin-top:10px">Cargando…</div></div>
 </main>
 <footer>PAPU-LAN · <span class="sticker">SEGUIDORES DE LA GRASA</span> · practica de Sistemas Operativos · red local</footer>
 <script>
@@ -272,7 +268,10 @@ function verSesion(){document.getElementById('login').style.display=YO?'none':'f
 document.getElementById('meinfo').textContent=YO?('USUARIO '+YO+(NOMBRE?' · '+NOMBRE:'')):'Sin sesion';
 if(YO){document.getElementById('linum').value=YO;document.getElementById('linom').value=NOMBRE||''}}
 async function ping(){if(!YO)return;await fetch('/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:YO})})}
-async function cargarTodo(){verSesion();if(!YO)return;ping();cargarFiles();cargarMsgs();cargarConn();cargarUsers();cargarOffers()}
+function avisarSalida(){if(!YO)return;try{navigator.sendBeacon('/api/leave',JSON.stringify({numero:YO}))}catch(e){}}
+window.addEventListener('pagehide',avisarSalida);
+document.addEventListener('visibilitychange',()=>{if(document.hidden){avisarSalida()}else{ping();cargarUsers()}});
+async function cargarTodo(){verSesion();if(!YO)return;ping();cargarFiles();cargarConn();cargarUsers();cargarOffers()}
 async function cargarConn(){try{const r=await fetch('/api/info');const d=await r.json();window._url='http://'+d.ip+':'+d.port;document.getElementById('conn').innerHTML='En tu celular abre:<br><b>'+window._url+'</b><br><span style="color:var(--mut);font-size:12px">'+d.host+'</span>'}catch(e){}}
 async function copiar(){try{await navigator.clipboard.writeText(window._url||'');alert('Dirección copiada')}catch(e){}}
 async function cargarUsers(){try{const r=await fetch('/api/users');USERS=await r.json();pintarUsers()}catch(e){}}
@@ -298,8 +297,6 @@ async function pedir(){const f=document.getElementById('selFile').value;const t=
 if(!YO){alert('Entra primero con tu numero');return}if(!f){alert('Sube o elige un archivo');return}if(!t){alert('Escribe el numero destino');return}
 const r=await fetch('/api/offers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:YO,to:t,file:f})});
 const d=await r.json();document.getElementById('st2').textContent=d.ok?'Peticion enviada a '+t:'Error: '+(d.error||'Error');cargarOffers()}
-async function cargarMsgs(){try{const r=await fetch('/api/messages');const m=await r.json();
-document.getElementById('msgs').innerHTML=m.length?m.slice().reverse().slice(0,20).map(x=>`<div class="msg"><div class="m"><b>${x.autor}</b> · ${x.fecha}</div><div class="t">${x.texto}</div></div>`).join(''):'<p style="color:var(--mut)">Sin mensajes.</p>'}catch(e){}}
 async function subir(){const inp=document.getElementById('file');if(!inp.files.length){document.getElementById('st').textContent='Elige al menos un archivo.';return}
 const fd=new FormData();for(const f of inp.files)fd.append('f',f,f.name);
 document.getElementById('st').textContent='Subiendo…';
@@ -307,14 +304,11 @@ const r=await fetch('/api/upload?from='+encodeURIComponent(YO),{method:'POST',bo
 document.getElementById('st').textContent=(d.ok?('OK: '+d.saved.join(', ')):'Error: '+(d.error||'Error al subir'))+(d.aviso?' · '+d.aviso:'');
 inp.value='';cargarFiles()}
 async function borrar(n){if(!confirm('¿Eliminar "'+n+'"?'))return;await fetch('/api/files/'+encodeURIComponent(n),{method:'DELETE'});cargarFiles()}
-async function enviarMsg(){const t=document.getElementById('texto').value.trim();if(!t||!YO)return;
-await fetch('/api/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({autor:YO+(NOMBRE?' '+NOMBRE:''),texto:t})});
-document.getElementById('texto').value='';cargarMsgs()}
 const drop=document.getElementById('drop');if(drop){
 ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
 drop.addEventListener('drop',ev=>{document.getElementById('file').files=ev.dataTransfer.files;subir()})}
-verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){ping();cargarUsers();cargarOffers();cargarFiles()}},8000);
+verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){ping();cargarUsers();cargarOffers();cargarFiles()}},5000);
 </script>
 </body>
 </html>
@@ -446,6 +440,15 @@ class Handler(BaseHTTPRequestHandler):
                     found = True
             if not found:
                 users.append({"numero": num, "nombre": "", "seen": time.time()})
+            _save_json(USERS_FILE, users[-500:])
+            return self._json({"ok": True})
+        elif path == "/api/leave":
+            d = self._body_json()
+            num = clean_num(d.get("numero", ""))
+            users = _load_json(USERS_FILE, [])
+            for x in users:
+                if x.get("numero") == num:
+                    x["seen"] = 0
             _save_json(USERS_FILE, users[-500:])
             return self._json({"ok": True})
         elif path == "/api/upload":

@@ -42,5 +42,5 @@ papu-lan/
   logo.png      escudo SDLG
   iniciar.sh    arranque rapido
   archivos/     archivos subidos (se ignoran en git)
-  data/         usuarios, peticiones y mensajes en JSON (se ignoran en git)
+  data/         usuarios, peticiones y archivos en JSON (se ignoran en git)
 ```

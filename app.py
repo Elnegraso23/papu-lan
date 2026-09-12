@@ -239,14 +239,11 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 <div class="row"><button onclick="subir()">SUBIR ARCHIVOS</button></div>
 <p id="st" style="font-size:13px;color:var(--mut);margin-top:8px"></p></div>
 <div class="grid2">
-<div class="card"><h2>2. BUSCA A LA PERSONA</h2>
-<input id="buscar" placeholder="Buscar por numero o nombre…" oninput="pintarUsers()">
-<div id="users">Cargando usuarios…</div></div>
-<div class="card"><h2>3. MANDA LA PETICION</h2>
+<div class="card"><h2>2. MANDA LA PETICION</h2>
 <label style="font-size:13px;color:var(--mut)">Archivo</label>
 <select id="selFile" style="margin:6px 0 10px"></select>
 <label style="font-size:13px;color:var(--mut)">Para (numero de usuario)</label>
-<input id="dest" placeholder="Ej. 2024015" style="margin:6px 0 10px" maxlength="20">
+<input id="dest" placeholder="Numero del destinatario (ej. 2024015)" style="margin:6px 0 10px" maxlength="20" inputmode="numeric">
 <div class="row"><button onclick="pedir()">ENVIAR PETICION DE INTERCAMBIO</button></div>
 <p id="st2" style="font-size:13px;color:var(--mut);margin-top:8px"></p></div>
 </div>
@@ -270,15 +267,10 @@ if(YO){document.getElementById('linum').value=YO;document.getElementById('linom'
 async function ping(){if(!YO)return;await fetch('/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:YO})})}
 function avisarSalida(){if(!YO)return;try{navigator.sendBeacon('/api/leave',JSON.stringify({numero:YO}))}catch(e){}}
 window.addEventListener('pagehide',avisarSalida);
-document.addEventListener('visibilitychange',()=>{if(document.hidden){avisarSalida()}else{ping();cargarUsers()}});
-async function cargarTodo(){verSesion();if(!YO)return;ping();cargarFiles();cargarConn();cargarUsers();cargarOffers()}
+document.addEventListener('visibilitychange',()=>{if(document.hidden){avisarSalida()}else{ping()}});
+async function cargarTodo(){verSesion();if(!YO)return;ping();cargarFiles();cargarConn();cargarOffers()}
 async function cargarConn(){try{const r=await fetch('/api/info');const d=await r.json();window._url='http://'+d.ip+':'+d.port;document.getElementById('conn').innerHTML='En tu celular abre:<br><b>'+window._url+'</b><br><span style="color:var(--mut);font-size:12px">'+d.host+'</span>'}catch(e){}}
 async function copiar(){try{await navigator.clipboard.writeText(window._url||'');alert('Dirección copiada')}catch(e){}}
-async function cargarUsers(){try{const r=await fetch('/api/users');USERS=await r.json();pintarUsers()}catch(e){}}
-function pintarUsers(){const q=(document.getElementById('buscar').value||'').toLowerCase();
-const list=USERS.filter(u=>u.numero!==YO&&(!q||u.numero.toLowerCase().includes(q)||(u.nombre||'').toLowerCase().includes(q)));
-document.getElementById('users').innerHTML=list.length?list.slice(0,30).map(u=>`<div class="usr"><span class="dot ${u.online?'on':''}"></span><span><b>${u.numero}</b> <small>${u.nombre||''} ${u.online?'· en línea':'· ausente'}</small></span><button class="ghost" style="width:auto;min-height:40px;padding:6px 12px;margin-left:auto" onclick="elegir('${u.numero}')">ELEGIR</button></div>`).join(''):'<p style="color:var(--mut)">Sin resultados. Igual puedes escribir el numero manualmente abajo.</p>'}
-function elegir(n){document.getElementById('dest').value=n;document.getElementById('dest').scrollIntoView({behavior:'smooth',block:'center'})}
 async function cargarFiles(){try{const r=await fetch('/api/files');FILES=await r.json();
 document.getElementById('selFile').innerHTML=FILES.filter(f=>!YO||f.from===YO||!f.from).map(f=>`<option value="${f.name}">${f.name} (${f.size_h})</option>`).join('')||'<option value="">(sube un archivo primero)</option>'}catch(e){}}
 async function cargarOffers(){if(!YO)return;try{const r=await fetch('/api/offers?user='+encodeURIComponent(YO));OFFERS=await r.json();
@@ -308,7 +300,7 @@ const drop=document.getElementById('drop');if(drop){
 ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
 drop.addEventListener('drop',ev=>{document.getElementById('file').files=ev.dataTransfer.files;subir()})}
-verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){ping();cargarUsers();cargarOffers();cargarFiles()}},5000);
+verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){ping();cargarOffers();cargarFiles()}},5000);
 </script>
 </body>
 </html>

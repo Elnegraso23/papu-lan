@@ -1,137 +1,221 @@
 #!/usr/bin/env python3
 """
-PAPU-LAN - Intercambio de archivos y datos en red local universitaria.
+PAPU-LAN - Intercambio de archivos en red local universitaria.
 Sin dependencias: solo Python 3 stdlib.
+
 Uso:
-    python3 app.py [--port 8000] [--dir ./archivos]
+    python3 app.py [--port 8000] [--dir ./archivos] [--data ./data] [--ip 192.168.0.10]
 Luego abre en el navegador: http://<IP-local>:8000
 """
 import argparse
-import html
 import json
 import mimetypes
 import os
+import secrets
+import shutil
 import socket
 import sys
+import tempfile
+import threading
 import time
 import urllib.parse
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 BASE = Path(__file__).parent.resolve()
 ARCHIVOS = BASE / "archivos"
 DATA = BASE / "data"
-MSG_FILE = DATA / "mensajes.json"
-USERS_FILE = DATA / "usuarios.json"
 OFFERS_FILE = DATA / "peticiones.json"
 FILES_META = DATA / "archivos.json"
-MAX_MSG = 200
-ONLINE_SECS = 15
-# Límites de transferencia entre usuarios
-MAX_FILE_MB = 100            # tamaño máximo por archivo
-MAX_FILES_PER_USER = 10      # archivos máximos subidos por usuario
-FILE_TTL_H = 2               # se borra si nadie lo descarga en 2 h
-OFFER_TTL_MIN = 30           # la petición pendiente expira en 30 min
-MAX_BYTES = MAX_FILE_MB * 1024 * 1024
 
-ARCHIVOS.mkdir(exist_ok=True)
-DATA.mkdir(exist_ok=True)
-if not MSG_FILE.exists():
-    MSG_FILE.write_text("[]", encoding="utf-8")
-for _f in (USERS_FILE, OFFERS_FILE, FILES_META):
-    if not _f.exists():
-        _f.write_text("{}" if "archivos" in _f.name else "[]", encoding="utf-8")
+# Limites de transferencia entre usuarios
+MAX_FILE_MB = 100            # tamano maximo por archivo
+MAX_FILES_PER_USER = 10      # archivos maximos subidos por usuario
+MAX_OFFERS_PER_USER = 10     # peticiones pendientes maximas por usuario
+FILE_TTL_H = 2               # se borra si nadie lo descarga en 2 h
+OFFER_TTL_MIN = 30           # la peticion pendiente expira en 30 min
+MAX_BYTES = MAX_FILE_MB * 1024 * 1024
+MAX_NAME_LEN = 120           # largo maximo del nombre de archivo
+MAX_JSON_BYTES = 64 * 1024   # tope del cuerpo JSON de las peticiones
+SWEEP_SECS = 60              # cada cuanto corre la limpieza
+OFFERS_KEEP = 300            # peticiones que se conservan en el historial
+
+# Un solo candado para todos los JSON: las escrituras son criticas y cortas.
+LOCK = threading.RLock()
+
+
+def init_dirs(archivos=None, data=None):
+    """Prepara las carpetas de trabajo. Se llama desde main() y desde los tests."""
+    global ARCHIVOS, DATA, OFFERS_FILE, FILES_META
+    if archivos:
+        ARCHIVOS = Path(archivos).resolve()
+    if data:
+        DATA = Path(data).resolve()
+    ARCHIVOS.mkdir(parents=True, exist_ok=True)
+    DATA.mkdir(parents=True, exist_ok=True)
+    OFFERS_FILE = DATA / "peticiones.json"
+    FILES_META = DATA / "archivos.json"
+    if not OFFERS_FILE.exists():
+        _save_json(OFFERS_FILE, [])
+    if not FILES_META.exists():
+        _save_json(FILES_META, {})
 
 
 def _load_json(p, default):
     try:
-        return json.loads(Path(p).read_text(encoding="utf-8"))
+        with LOCK:
+            return json.loads(Path(p).read_text(encoding="utf-8"))
     except Exception:
         return default
 
 
 def _save_json(p, obj):
-    Path(p).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    """Escritura atomica: escribe a un temporal y lo renombra.
+
+    Un Ctrl+C o un corte de luz nunca deja el JSON a medias.
+    """
+    p = Path(p)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with LOCK:
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(obj, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, p)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def clean_num(s: str) -> str:
     return "".join(ch for ch in str(s).strip() if ch.isalnum() or ch in ("-", "_"))[:20]
 
 
+def safe_name(name: str) -> str:
+    """Nombre de archivo seguro: sin rutas, sin caracteres de control ni de HTML."""
+    name = str(name).replace("\\", "/")
+    name = os.path.basename(name).strip()
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '<>:"|?*')
+    name = name.strip(" .")
+    if not name or name in (".", ".."):
+        return f"archivo_{int(time.time())}"
+    if len(name) > MAX_NAME_LEN:
+        suf = Path(name).suffix[:16]
+        name = Path(name).stem[: MAX_NAME_LEN - len(suf)] + suf
+    return name
+
+
+def _unique_dest(fn: str) -> Path:
+    """Primer nombre libre: a.txt, a_1.txt, a_2.txt (antes se acumulaba a_1_2)."""
+    dest = ARCHIVOS / fn
+    if not dest.exists():
+        return dest
+    stem, suf = Path(fn).stem, Path(fn).suffix
+    i = 1
+    while True:
+        dest = ARCHIVOS / f"{stem}_{i}{suf}"
+        if not dest.exists():
+            return dest
+        i += 1
+
+
 def _sweep():
-    """Limpieza: borra archivos vencidos y expira peticiones viejas."""
+    """Limpieza: borra archivos vencidos, expira peticiones y quita metadatos huerfanos."""
     now = time.time()
     try:
-        meta = _load_json(FILES_META, {})
-        offers = _load_json(OFFERS_FILE, [])
-        # Expirar peticiones pendientes
-        dirty_o = False
-        for o in offers:
-            if o.get("status") == "pendiente" and now - float(o.get("ts", now)) > OFFER_TTL_MIN * 60:
-                o["status"] = "expirada"
-                dirty_o = True
-        if dirty_o:
-            _save_json(OFFERS_FILE, offers[-300:])
-        # Borrar archivos vencidos (2 h sin descargar)
-        dirty_m = False
-        for name, m in list(meta.items()):
-            if now - float(m.get("ts", now)) > FILE_TTL_H * 3600:
+        with LOCK:
+            meta = _load_json(FILES_META, {})
+            offers = _load_json(OFFERS_FILE, [])
+            dirty_o = False
+            for o in offers:
+                if o.get("status") == "pendiente" and now - float(o.get("ts", now)) > OFFER_TTL_MIN * 60:
+                    o["status"] = "expirada"
+                    dirty_o = True
+            if dirty_o:
+                _save_json(OFFERS_FILE, offers[-OFFERS_KEEP:])
+            dirty_m = False
+            for name, m in list(meta.items()):
+                vencido = now - float(m.get("ts", now)) > FILE_TTL_H * 3600
+                if vencido or not (ARCHIVOS / name).is_file():
+                    if vencido:
+                        try:
+                            (ARCHIVOS / name).unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                    meta.pop(name, None)
+                    dirty_m = True
+            if dirty_m:
+                _save_json(FILES_META, meta)
+            # restos de subidas interrumpidas
+            for t in ARCHIVOS.glob(".subiendo_*.part"):
                 try:
-                    (ARCHIVOS / name).unlink(missing_ok=True)
+                    if now - t.stat().st_mtime > 3600:
+                        t.unlink(missing_ok=True)
                 except Exception:
                     pass
-                meta.pop(name, None)
-                dirty_m = True
-        if dirty_m:
-            _save_json(FILES_META, meta)
     except Exception:
         pass
+
+
+def _sweep_loop():
+    while True:
+        time.sleep(SWEEP_SECS)
+        _sweep()
 
 
 def _oneshot_delete(name: str):
-    """Borra el archivo tras ser descargado y marca sus peticiones como completadas."""
+    """Borra el archivo descargado y cierra TODAS las peticiones que lo usaban."""
     try:
         (ARCHIVOS / name).unlink(missing_ok=True)
-        meta = _load_json(FILES_META, {})
-        meta.pop(name, None)
-        _save_json(FILES_META, meta)
-        offers = _load_json(OFFERS_FILE, [])
-        for o in offers:
-            if o.get("file") == name and o.get("status") == "aceptada":
-                o["status"] = "completada"
-        _save_json(OFFERS_FILE, offers[-300:])
+        with LOCK:
+            meta = _load_json(FILES_META, {})
+            meta.pop(name, None)
+            _save_json(FILES_META, meta)
+            offers = _load_json(OFFERS_FILE, [])
+            for o in offers:
+                if o.get("file") == name and o.get("status") in ("pendiente", "aceptada"):
+                    o["status"] = "completada"
+            _save_json(OFFERS_FILE, offers[-OFFERS_KEEP:])
     except Exception:
         pass
 
 
-def get_lan_ip():
+def get_lan_ip(prefer=None):
+    if prefer:
+        return prefer
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         ip = s.getsockname()[0]
         s.close()
-        return ip
+        if ip and not ip.startswith("127."):
+            return ip
     except Exception:
-        return socket.gethostbyname(socket.gethostname())
-
-
-def safe_name(name: str) -> str:
-    name = os.path.basename(name.strip())
-    if not name or name in (".", ".."):
-        return f"archivo_{int(time.time())}"
-    return name
-
-
-def load_msgs():
+        pass
     try:
-        return json.loads(MSG_FILE.read_text(encoding="utf-8"))
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127."):
+                return ip
     except Exception:
-        return []
+        pass
+    return "127.0.0.1"
 
 
-def save_msgs(msgs):
-    MSG_FILE.write_text(json.dumps(msgs[-MAX_MSG:], ensure_ascii=False, indent=2), encoding="utf-8")
+def all_lan_ips():
+    ips = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith("127.") and ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    main = get_lan_ip()
+    if main not in ips:
+        ips.insert(0, main)
+    return ips
 
 
 def fmt_size(n):
@@ -142,10 +226,100 @@ def fmt_size(n):
     return f"{n:.1f} TB"
 
 
+class _Multipart:
+    """Lector multipart en streaming: nunca carga el cuerpo completo en memoria."""
+
+    def __init__(self, rfile, boundary, length):
+        self.rfile = rfile
+        self.delim = b"--" + boundary
+        self.left = max(0, int(length))
+        self.buf = b""
+
+    def _fill(self, size=65536):
+        if self.left <= 0:
+            return False
+        try:
+            data = self.rfile.read(min(size, self.left))
+        except Exception:
+            data = b""
+        if not data:
+            self.left = 0
+            return False
+        self.left -= len(data)
+        self.buf += data
+        return True
+
+    def _line(self):
+        while b"\r\n" not in self.buf:
+            if not self._fill():
+                line, self.buf = self.buf, b""
+                return line
+        line, _, self.buf = self.buf.partition(b"\r\n")
+        return line
+
+    def _body_to(self, fh):
+        # El separador real es CRLF + "--boundary": asi un archivo que
+        # contenga "--boundary" en su contenido no se corta.
+        sep = b"\r\n" + self.delim
+        keep = len(sep) + 2
+        size = 0
+        while True:
+            idx = self.buf.find(sep)
+            if idx != -1:
+                fh.write(self.buf[:idx])
+                size += idx
+                self.buf = self.buf[idx + len(sep):]
+                return size
+            if len(self.buf) > keep:
+                chunk = self.buf[:-keep]
+                fh.write(chunk)
+                size += len(chunk)
+                self.buf = self.buf[-keep:]
+            if not self._fill():
+                fh.write(self.buf)
+                size += len(self.buf)
+                self.buf = b""
+                return size
+
+    def parts(self):
+        """Genera (filename, size, tmp_path) escribiendo cada parte a disco."""
+        line = self._line()
+        while line and not line.startswith(self.delim):
+            line = self._line()          # preambulo
+        if not line:
+            return
+        while True:
+            if line[len(self.delim):].startswith(b"--"):
+                return
+            cd = ""
+            while True:
+                ln = self._line()
+                if not ln:
+                    break
+                k, _, v = ln.partition(b":")
+                if k.strip().lower() == b"content-disposition":
+                    cd = v.strip().decode("utf-8", "ignore")
+            fn = ""
+            if 'filename="' in cd:
+                fn = cd.split('filename="', 1)[1].split('"', 1)[0]
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False, dir=str(ARCHIVOS), prefix=".subiendo_", suffix=".part"
+            )
+            with tmp:
+                size = self._body_to(tmp)
+            yield fn, size, Path(tmp.name)
+            if self.buf.startswith(b"--"):
+                return
+            if self.buf.startswith(b"\r\n"):
+                self.buf = self.buf[2:]
+            line = self.delim
+
+
 PAGE = """<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
+<link rel="icon" href="/logo.png">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <meta name="theme-color" content="#0c0c0e">
 <title>PAPU-LAN · SDLG · Red local</title>
@@ -215,7 +389,7 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 <header>
 <div class="logo"><img class="escudo" src="/logo.png" alt="SDLG"></div>
 <div class="t"><h1>PAPU-LAN</h1><p>SEGUIDORES DE LA GRASA</p></div>
-<div class="badge">EN LINEA</div>
+<div class="badge" id="badge">EN LÍNEA</div>
 </header>
 <div id="login"><div class="box">
 <img class="escudo-big" src="/logo.png" alt="Seguidores de la Grasa">
@@ -249,60 +423,77 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 <div class="row"><button onclick="pedir()">ENVIAR PETICION DE INTERCAMBIO</button></div>
 <p id="st2" style="font-size:13px;color:var(--mut);margin-top:8px"></p></div>
 </div>
+<div class="card"><h2>MIS ARCHIVOS EN EL SERVIDOR</h2>
+<div id="mine">—</div>
+<p style="color:var(--mut);font-size:12px;margin-top:8px">Se borran solos al descargarlos o a las 2 h.</p></div>
 <div class="card"><h2>PETICIONES PARA TI <span style="font-size:12px;color:var(--mut)">(acepta para iniciar la transferencia)</span></h2><div id="inbox">—</div></div>
 <div class="card"><h2>TUS PETICIONES ENVIADAS</h2><div id="outbox">—</div></div>
 </main>
 <footer>PAPU-LAN · <span class="sticker">SEGUIDORES DE LA GRASA</span> · practica de Sistemas Operativos · red local</footer>
 <script>
-let YO='',NOMBRE='',USERS=[],FILES=[],OFFERS=[];
-YO=localStorage.getItem('papu_num')||'';NOMBRE=localStorage.getItem('papu_nom')||'';
-async function entrar(){const n=document.getElementById('linum').value.trim();if(!n){alert('Pon tu numero de usuario');return}
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let YO=localStorage.getItem('papu_num')||'',NOMBRE=localStorage.getItem('papu_nom')||'',FILES=[],OFFERS=[];
+function badge(txt,ok){const b=document.getElementById('badge');if(!b)return;b.textContent=txt;b.style.background=ok?'var(--acc2)':'#3a3a3a';b.style.color=ok?'#fff':'var(--mut)'}
+async function entrar(){const n=document.getElementById('linum').value.trim();if(!n){alert('Pon tu número de usuario');return}
 const nm=document.getElementById('linom').value.trim();
 const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:n,nombre:nm})});
 const d=await r.json();if(!d.ok){alert('No se pudo entrar');return}
 YO=d.numero;NOMBRE=d.nombre||nm;localStorage.setItem('papu_num',YO);localStorage.setItem('papu_nom',NOMBRE);
 verSesion();cargarTodo()}
-function salir(){localStorage.removeItem('papu_num');YO='';verSesion()}
+function salir(){localStorage.removeItem('papu_num');localStorage.removeItem('papu_nom');YO='';NOMBRE='';verSesion()}
 function verSesion(){document.getElementById('login').style.display=YO?'none':'flex';
-document.getElementById('meinfo').textContent=YO?('USUARIO '+YO+(NOMBRE?' · '+NOMBRE:'')):'Sin sesion';
+document.getElementById('meinfo').textContent=YO?('USUARIO '+YO+(NOMBRE?' · '+NOMBRE:'')):'Sin sesión';
 if(YO){document.getElementById('linum').value=YO;document.getElementById('linom').value=NOMBRE||''}}
-async function ping(){if(!YO)return;await fetch('/api/ping',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:YO})})}
-function avisarSalida(){if(!YO)return;try{navigator.sendBeacon('/api/leave',JSON.stringify({numero:YO}))}catch(e){}}
-window.addEventListener('pagehide',avisarSalida);
-document.addEventListener('visibilitychange',()=>{if(document.hidden){avisarSalida()}else{ping()}});
-async function cargarTodo(){verSesion();if(!YO)return;ping();cargarFiles();cargarConn();cargarOffers()}
-async function cargarConn(){try{const r=await fetch('/api/info');const d=await r.json();window._url='http://'+d.ip+':'+d.port;document.getElementById('conn').innerHTML='En tu celular abre:<br><b>'+window._url+'</b><br><span style="color:var(--mut);font-size:12px">'+d.host+'</span>'}catch(e){}}
-async function copiar(){try{await navigator.clipboard.writeText(window._url||'');alert('Dirección copiada')}catch(e){}}
-async function cargarFiles(){try{const r=await fetch('/api/files');FILES=await r.json();
-document.getElementById('selFile').innerHTML=FILES.filter(f=>!YO||f.from===YO||!f.from).map(f=>`<option value="${f.name}">${f.name} (${f.size_h})</option>`).join('')||'<option value="">(sube un archivo primero)</option>'}catch(e){}}
+async function cargarTodo(){verSesion();if(!YO)return;cargarFiles();cargarConn();cargarOffers()}
+async function cargarConn(){try{const r=await fetch('/api/info');const d=await r.json();
+window._url='http://'+d.ip+':'+d.port;
+document.getElementById('conn').innerHTML='En tu celular abre:<br><b>'+esc(window._url)+'</b><br><span style="color:var(--mut);font-size:12px">'+esc(d.host)+'</span>'}catch(e){badge('SIN CONEXIÓN',false)}}
+function avisoCopiado(){const b=document.querySelector('.copy');if(!b)return;const t=b.textContent;b.textContent='✓ DIRECCIÓN COPIADA';setTimeout(()=>{b.textContent=t},1600)}
+function copiar(){const url=window._url||'';
+const manual=()=>{try{const ta=document.createElement('textarea');ta.value=url;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.top='-1000px';document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,99999);const ok=document.execCommand('copy');document.body.removeChild(ta);if(ok){avisoCopiado();return}}catch(e){}
+if(url){prompt('Copia la dirección:',url)}};
+if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(url).then(avisoCopiado,manual);return}
+manual()}
+async function cargarFiles(){if(!YO)return;try{const r=await fetch('/api/files?user='+encodeURIComponent(YO));FILES=await r.json();
+document.getElementById('selFile').innerHTML=FILES.map(f=>`<option value="${esc(f.name)}">${esc(f.name)} (${esc(f.size_h)})</option>`).join('')||'<option value="">(sube un archivo primero)</option>';
+document.getElementById('mine').innerHTML=FILES.length?FILES.map((f,i)=>`<div class="fila"><span class="ico">&#128196;</span><span class="n">${esc(f.name)}</span><span class="s">${esc(f.size_h)} · ${esc(f.date)}</span><div class="acc"><button class="danger" data-i="${i}">ELIMINAR</button></div></div>`).join(''):'<p style="color:var(--mut);font-size:13px">Aún no has subido archivos.</p>';badge('EN LÍNEA',true)}catch(e){badge('SIN CONEXIÓN',false)}}
+async function borrar(n){if(!confirm('¿Eliminar "'+n+'" del servidor?'))return;
+const r=await fetch('/api/files/'+encodeURIComponent(n)+'?by='+encodeURIComponent(YO),{method:'DELETE'});
+const d=await r.json();if(!d.ok)alert('No se pudo eliminar: '+(d.error||'error'));cargarFiles()}
 async function cargarOffers(){if(!YO)return;try{const r=await fetch('/api/offers?user='+encodeURIComponent(YO));OFFERS=await r.json();
 const inc=OFFERS.filter(o=>o.to===YO),out=OFFERS.filter(o=>o.from===YO);
 document.getElementById('inbox').innerHTML=inc.length?inc.map(o=>{
-if(o.status==='pendiente')return `<div class="off pend"><div class="t2">${o.file}</div><div class="d">De <b>${o.from}</b> · ${o.fecha} · pendiente tu respuesta</div><div class="btns"><button onclick="resp('${o.id}',true)">ACEPTAR E INICIAR TRANSFERENCIA</button><button class="ghost" onclick="resp('${o.id}',false)">RECHAZAR</button></div></div>`;
-if(o.status==='aceptada')return `<div class="off ok"><div class="t2">${o.file}</div><div class="d">De ${o.from} · aceptada · la transferencia esta en curso</div><div class="btns"><a href="/download/${encodeURIComponent(o.file)}?by=${encodeURIComponent(YO)}" style="flex:1;text-align:center;background:var(--acc);color:#000;font-family:Arial Black,Arial,sans-serif;text-decoration:none;border:3px solid #000;border-radius:8px;padding:13px">DESCARGAR AHORA (SE BORRA AL DESCARGAR)</a></div></div>`;
-if(o.status==='completada')return `<div class="off ok"><div class="t2">${o.file}</div><div class="d">De ${o.from} · ya se descargo y se borro del servidor</div></div>`;
-if(o.status==='expirada')return `<div class="off no"><div class="t2">${o.file}</div><div class="d">De ${o.from} · la peticion expiro (30 min), pide que te la manden de nuevo</div></div>`;
-return `<div class="off no"><div class="t2">${o.file}</div><div class="d">De ${o.from} · ${o.status}</div></div>`}).join(''):'<p style="color:var(--mut)">Sin peticiones por ahora.</p>';
+if(o.status==='pendiente')return `<div class="off pend"><div class="t2">${esc(o.file)}</div><div class="d">De <b>${esc(o.from)}</b> · ${esc(o.fecha)} · pendiente tu respuesta</div><div class="btns"><button onclick="resp('${esc(o.id)}',true)">ACEPTAR E INICIAR TRANSFERENCIA</button><button class="ghost" onclick="resp('${esc(o.id)}',false)">RECHAZAR</button></div></div>`;
+if(o.status==='aceptada')return `<div class="off ok"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · aceptada · la transferencia está en curso</div><div class="btns"><a href="/download/${encodeURIComponent(o.file)}?by=${encodeURIComponent(YO)}" style="flex:1;text-align:center;background:var(--acc);color:#000;font-family:Arial Black,Arial,sans-serif;text-decoration:none;border:3px solid #000;border-radius:8px;padding:13px">DESCARGAR AHORA (SE BORRA AL DESCARGAR)</a></div></div>`;
+if(o.status==='completada')return `<div class="off ok"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · ya se descargó y se borró del servidor</div></div>`;
+if(o.status==='expirada')return `<div class="off no"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · la petición expiró (30 min), pide que te la manden de nuevo</div></div>`;
+return `<div class="off no"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · ${esc(o.status)}</div></div>`}).join(''):'<p style="color:var(--mut)">Sin peticiones por ahora.</p>';
 document.getElementById('outbox').innerHTML=out.length?out.map(o=>{
-let extra=o.status==='aceptada'?` · <a href="/download/${encodeURIComponent(o.file)}" style="color:var(--acc)">descargar</a>`:'';
-return `<div class="off ${o.status==='pendiente'?'pend':o.status==='aceptada'?'ok':'no'}"><div class="t2">${o.status.toUpperCase()} · ${o.file}</div><div class="d">Para <b>${o.to}</b> · ${o.fecha}${extra}</div></div>`}).join(''):'<p style="color:var(--mut)">Aún no envías peticiones.</p>'}catch(e){}}
-async function resp(id,ok){await fetch('/api/offers/'+id+(ok?'/accept':'/reject'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:YO})});cargarOffers()}
+let extra=o.status==='aceptada'?` · <a href="/download/${encodeURIComponent(o.file)}?by=${encodeURIComponent(YO)}" style="color:var(--acc)">descargar</a>`:'';
+return `<div class="off ${o.status==='pendiente'?'pend':o.status==='aceptada'?'ok':'no'}"><div class="t2">${esc(String(o.status).toUpperCase())} · ${esc(o.file)}</div><div class="d">Para <b>${esc(o.to)}</b> · ${esc(o.fecha)}${extra}</div></div>`}).join(''):'<p style="color:var(--mut)">Aún no envías peticiones.</p>';badge('EN LÍNEA',true)}catch(e){badge('SIN CONEXIÓN',false)}}
+async function resp(id,ok){await fetch('/api/offers/'+encodeURIComponent(id)+(ok?'/accept':'/reject'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:YO})});cargarOffers()}
 async function pedir(){const f=document.getElementById('selFile').value;const t=document.getElementById('dest').value.trim();
-if(!YO){alert('Entra primero con tu numero');return}if(!f){alert('Sube o elige un archivo');return}if(!t){alert('Escribe el numero destino');return}
+if(!YO){alert('Entra primero con tu número');return}if(!f){alert('Sube o elige un archivo');return}if(!t){alert('Escribe el número destino');return}
 const r=await fetch('/api/offers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:YO,to:t,file:f})});
-const d=await r.json();document.getElementById('st2').textContent=d.ok?'Peticion enviada a '+t:'Error: '+(d.error||'Error');cargarOffers()}
+const d=await r.json();const st=document.getElementById('st2');
+st.textContent=d.ok?('Petición enviada a '+t+(d.repetida?' (ya existía)':'')):'Error: '+(d.error||'Error');
+st.style.color=d.ok?'var(--mut)':'#ff8080';cargarOffers()}
 async function subir(){const inp=document.getElementById('file');if(!inp.files.length){document.getElementById('st').textContent='Elige al menos un archivo.';return}
+if(!YO){alert('Entra primero con tu número');return}
 const fd=new FormData();for(const f of inp.files)fd.append('f',f,f.name);
-document.getElementById('st').textContent='Subiendo…';
-const r=await fetch('/api/upload?from='+encodeURIComponent(YO),{method:'POST',body:fd});const d=await r.json();
-document.getElementById('st').textContent=(d.ok?('OK: '+d.saved.join(', ')):'Error: '+(d.error||'Error al subir'))+(d.aviso?' · '+d.aviso:'');
+const st=document.getElementById('st');st.textContent='Subiendo…';st.style.color='var(--mut)';
+try{const r=await fetch('/api/upload?from='+encodeURIComponent(YO),{method:'POST',body:fd});
+const d=await r.json();
+st.style.color=d.ok?'var(--mut)':'#ff8080';
+st.textContent=(d.ok?('OK: '+d.saved.join(', ')):'Error: '+(d.error||'Error al subir'))+(d.aviso?' · '+d.aviso:'');badge('EN LÍNEA',true)}
+catch(e){st.style.color='#ff8080';st.textContent='Error de red al subir';badge('SIN CONEXIÓN',false)}
 inp.value='';cargarFiles()}
-async function borrar(n){if(!confirm('¿Eliminar "'+n+'"?'))return;await fetch('/api/files/'+encodeURIComponent(n),{method:'DELETE'});cargarFiles()}
 const drop=document.getElementById('drop');if(drop){
 ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
-drop.addEventListener('drop',ev=>{document.getElementById('file').files=ev.dataTransfer.files;subir()})}
-verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){ping();cargarOffers();cargarFiles()}},5000);
+drop.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length){document.getElementById('file').files=ev.dataTransfer.files;subir()}})}
+document.getElementById('mine').addEventListener('click',ev=>{const b=ev.target.closest('button[data-i]');if(b)borrar(FILES[+b.dataset.i].name)});
+verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){cargarOffers();cargarFiles()}},5000);
 </script>
 </body>
 </html>
@@ -310,11 +501,22 @@ verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){ping();cargarOffers();car
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "PapuLAN/1.0"
+    server_version = "PapuLAN/2.0"
+    timeout = 30          # corta clientes colgados sin tumbar al resto
 
-    def log_message(self, *a):
-        sys.stdout.write(f"[{datetime.now():%H:%M:%S}] {a[0] % a[1:]}\n")
+    def log_message(self, fmt, *args):
+        try:
+            sys.stdout.write(f"[{datetime.now():%H:%M:%S}] {fmt % args}\n")
+        except Exception:
+            pass
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
+
+    # ---------- utilidades ----------
     def _json(self, obj, code=200):
         b = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -325,15 +527,18 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body_json(self):
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            n = int(self.headers.get("Content-Length", 0) or 0)
+            if n <= 0 or n > MAX_JSON_BYTES:
+                return {}
+            return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
         except Exception:
             return {}
 
+    # ---------- GET ----------
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         path, qs = u.path, urllib.parse.parse_qs(u.query)
-        _sweep()
+
         if path in ("/", "/index.html"):
             b = PAGE.encode("utf-8")
             self.send_response(200)
@@ -341,6 +546,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+
         elif path == "/logo.png":
             lp = BASE / "logo.png"
             if not lp.is_file():
@@ -350,39 +556,40 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "max-age=3600")
+            self.send_header("Cache-Control", "max-age=86400")
             self.end_headers()
             self.wfile.write(data)
+
         elif path == "/api/info":
             self._json({"ip": get_lan_ip(), "port": self.server.server_port,
                         "host": socket.gethostname()})
-        elif path == "/api/users":
-            users = _load_json(USERS_FILE, [])
-            now = time.time()
-            out = [{"numero": x.get("numero"), "nombre": x.get("nombre", ""),
-                    "online": (now - float(x.get("seen", 0))) < ONLINE_SECS}
-                   for x in users if x.get("numero")]
-            out.sort(key=lambda x: (not x["online"], x["numero"]))
-            self._json(out)
+
         elif path == "/api/files":
+            me = clean_num(qs.get("user", [""])[0])
+            if not me:
+                return self._json({"ok": False, "error": "falta ?user="}, 400)
             meta = _load_json(FILES_META, {})
             out = []
-            for f in sorted(ARCHIVOS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-                if f.is_file():
-                    st = f.stat()
-                    out.append({"name": f.name, "size": st.st_size,
-                                "size_h": fmt_size(st.st_size),
-                                "date": datetime.fromtimestamp(st.st_mtime).strftime("%d/%m %H:%M"),
-                                "from": meta.get(f.name, {}).get("from", "")})
+            for f in ARCHIVOS.iterdir():
+                if not f.is_file() or f.name.startswith("."):
+                    continue
+                if meta.get(f.name, {}).get("from") != me:
+                    continue
+                st = f.stat()
+                out.append({"name": f.name, "size": st.st_size,
+                            "size_h": fmt_size(st.st_size),
+                            "date": datetime.fromtimestamp(st.st_mtime).strftime("%d/%m %H:%M"),
+                            "from": me})
+            out.sort(key=lambda x: x["name"])
             self._json(out)
-        elif path == "/api/messages":
-            self._json(load_msgs())
+
         elif path == "/api/offers":
             me = clean_num(qs.get("user", [""])[0])
             offers = _load_json(OFFERS_FILE, [])
             mine = [o for o in offers if o.get("from") == me or o.get("to") == me]
             mine.sort(key=lambda o: o.get("ts", 0), reverse=True)
             self._json(mine[:60])
+
         elif path.startswith("/download/"):
             name = safe_name(urllib.parse.unquote(path[len("/download/"):]))
             by = clean_num(qs.get("by", [""])[0])
@@ -390,120 +597,123 @@ class Handler(BaseHTTPRequestHandler):
             if not fp.is_file():
                 self.send_error(404, "No existe o ya fue descargado")
                 return
-            meta_now = _load_json(FILES_META, {})
-            owner = meta_now.get(name, {}).get("from", "")
+            if not by:
+                return self._json({"ok": False, "error": "falta ?by=<numero>"}, 400)
+            meta = _load_json(FILES_META, {})
+            owner = meta.get(name, {}).get("from", "")
+            permitido = by == owner
+            if not permitido:
+                offers = _load_json(OFFERS_FILE, [])
+                permitido = any(o.get("file") == name and o.get("to") == by
+                                and o.get("status") == "aceptada" for o in offers)
+            if not permitido:
+                return self._json(
+                    {"ok": False, "error": "no tienes una petición aceptada para este archivo"}, 403)
+
+            size = fp.stat().st_size
             ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
-            data = fp.read_bytes()
+            fallback = name.encode("ascii", "replace").decode("ascii").replace('"', "_")
             self.send_response(200)
             self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(data)))
-            self.send_header("Content-Disposition", f'attachment; filename="{urllib.parse.quote(name)}"')
+            self.send_header("Content-Length", str(size))
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename=\"{fallback}\"; "
+                f"filename*=UTF-8''{urllib.parse.quote(name, safe='')}")
             self.end_headers()
-            self.wfile.write(data)
-            # Autodestrucción: si lo descarga otro usuario, se borra del servidor.
-            if by and by != owner:
+            with open(fp, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile, 64 * 1024)
+            # Autodestruccion: solo si lo baja alguien distinto del dueno.
+            if by != owner:
                 _oneshot_delete(name)
+
         else:
             self.send_error(404)
 
+    # ---------- POST ----------
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
         path, qs = u.path, urllib.parse.parse_qs(u.query)
+
         if path == "/api/login":
             d = self._body_json()
             num = clean_num(d.get("numero", ""))
-            nom = html.escape(str(d.get("nombre", ""))[:40].strip())
             if not num:
                 return self._json({"ok": False, "error": "numero requerido"}, 400)
-            # Por ahora no se valida que el número exista: se registra al entrar.
-            users = _load_json(USERS_FILE, [])
-            users = [x for x in users if x.get("numero") != num]
-            users.append({"numero": num, "nombre": nom, "seen": time.time()})
-            _save_json(USERS_FILE, users[-500:])
+            nom = str(d.get("nombre", ""))[:40].strip()
             return self._json({"ok": True, "numero": num, "nombre": nom})
-        elif path == "/api/ping":
-            d = self._body_json()
-            num = clean_num(d.get("numero", ""))
-            if not num:
-                return self._json({"ok": False}, 400)
-            users = _load_json(USERS_FILE, [])
-            found = False
-            for x in users:
-                if x.get("numero") == num:
-                    x["seen"] = time.time()
-                    found = True
-            if not found:
-                users.append({"numero": num, "nombre": "", "seen": time.time()})
-            _save_json(USERS_FILE, users[-500:])
-            return self._json({"ok": True})
-        elif path == "/api/leave":
-            d = self._body_json()
-            num = clean_num(d.get("numero", ""))
-            users = _load_json(USERS_FILE, [])
-            for x in users:
-                if x.get("numero") == num:
-                    x["seen"] = 0
-            _save_json(USERS_FILE, users[-500:])
-            return self._json({"ok": True})
-        elif path == "/api/upload":
+
+        if path == "/api/upload":
             frm = clean_num(qs.get("from", [""])[0])
+            if not frm:
+                return self._json({"ok": False, "error": "falta ?from=<numero>"}, 400)
             ctype = self.headers.get("Content-Type", "")
-            if "multipart/form-data" not in ctype:
+            if "multipart/form-data" not in ctype or "boundary=" not in ctype:
                 return self._json({"ok": False, "error": "multipart requerido"}, 400)
+            boundary = ctype.split("boundary=", 1)[1].strip().strip('"').encode()
             try:
-                boundary = ctype.split("boundary=")[1].encode()
-            except IndexError:
-                return self._json({"ok": False, "error": "boundary faltante"}, 400)
-            length = int(self.headers.get("Content-Length", 0) or 0)
-            if length > MAX_BYTES + 1024 * 1024:
-                return self._json({"ok": False, "error": f"límite: {MAX_FILE_MB} MB por archivo"}, 413)
-            meta = _load_json(FILES_META, {})
-            propios = sum(1 for m in meta.values() if m.get("from") == frm) if frm else 0
-            if frm and propios >= MAX_FILES_PER_USER:
-                return self._json({"ok": False, "error": f"límite: {MAX_FILES_PER_USER} archivos por usuario"}, 429)
-            raw = self.rfile.read(length)
-            saved, big = [], False
-            for part in raw.split(b"--" + boundary):
-                if b'filename="' not in part:
-                    continue
-                head, _, body = part.partition(b"\r\n\r\n")
-                fn = head.split(b'filename="')[1].split(b'"')[0].decode("utf-8", "ignore")
-                fn = safe_name(urllib.parse.unquote(fn))
-                body = body.rsplit(b"\r\n", 1)[0]
-                if not body:
-                    continue
-                if len(body) > MAX_BYTES:
-                    big = True
-                    continue
-                dest = ARCHIVOS / fn
-                i = 1
-                while dest.exists():
-                    dest = ARCHIVOS / f"{dest.stem}_{i}{dest.suffix}"
-                    i += 1
-                dest.write_bytes(body)
-                saved.append(dest.name)
-                meta[dest.name] = {"from": frm, "ts": time.time()}
-            _save_json(FILES_META, meta)
-            r = {"ok": bool(saved), "saved": saved,
-                 "limites": f"{MAX_FILE_MB} MB/archivo · {MAX_FILES_PER_USER} archivos/usuario · se borra al descargar o en {FILE_TTL_H} h"}
-            if big:
-                r["aviso"] = f"algún archivo superó {MAX_FILE_MB} MB y se rechazó"
-            return self._json(r)
-        elif path == "/api/messages":
+                length = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                length = 0
+            if length <= 0:
+                return self._json({"ok": False, "error": "Content-Length requerido"}, 411)
+
+            mp = _Multipart(self.rfile, boundary, length)
+            pendientes, rechazados, motivos = [], [], []
             try:
-                d = self._body_json()
-                texto = html.escape(str(d.get("texto", ""))[:1000].strip())
-                autor = html.escape(str(d.get("autor", "Anónimo"))[:40].strip()) or "Anónimo"
-                if not texto:
-                    return self._json({"ok": False}, 400)
-                msgs = load_msgs()
-                msgs.append({"autor": autor, "texto": texto,
-                             "fecha": datetime.now().strftime("%d/%m %H:%M")})
-                save_msgs(msgs)
-                return self._json({"ok": True})
-            except Exception as e:
-                return self._json({"ok": False, "error": str(e)}, 400)
-        elif path == "/api/offers":
+                for raw_name, size, tmp in mp.parts():
+                    fn = safe_name(urllib.parse.unquote(raw_name))
+                    if not fn:
+                        tmp.unlink(missing_ok=True)
+                        continue
+                    if size == 0:
+                        tmp.unlink(missing_ok=True)
+                        rechazados.append(fn)
+                        motivos.append(f"{fn}: archivo vacío")
+                        continue
+                    if size > MAX_BYTES:
+                        tmp.unlink(missing_ok=True)
+                        rechazados.append(fn)
+                        motivos.append(f"{fn}: supera {MAX_FILE_MB} MB")
+                        continue
+                    with LOCK:
+                        dest = _unique_dest(fn)
+                        try:
+                            os.replace(tmp, dest)
+                            os.chmod(dest, 0o644)
+                        except Exception:
+                            tmp.unlink(missing_ok=True)
+                            raise
+                    pendientes.append(dest)
+            except Exception:
+                for d in pendientes:
+                    d.unlink(missing_ok=True)
+                return self._json({"ok": False, "error": "cuerpo multipart inválido"}, 400)
+
+            saved = []
+            with LOCK:
+                meta = _load_json(FILES_META, {})
+                propios = sum(1 for m in meta.values() if m.get("from") == frm)
+                for dest in pendientes:
+                    if propios >= MAX_FILES_PER_USER:
+                        dest.unlink(missing_ok=True)
+                        rechazados.append(dest.name)
+                        motivos.append(f"{dest.name}: límite {MAX_FILES_PER_USER} archivos/usuario")
+                        continue
+                    meta[dest.name] = {"from": frm, "ts": time.time()}
+                    propios += 1
+                    saved.append(dest.name)
+                _save_json(FILES_META, meta)
+
+            r = {"ok": bool(saved), "saved": saved}
+            if rechazados:
+                r["rechazados"] = rechazados
+                r["aviso"] = "; ".join(motivos)
+            if not saved and not rechazados:
+                r["error"] = "no se recibió ningún archivo"
+            return self._json(r, 200 if saved else 400)
+
+        if path == "/api/offers":
             d = self._body_json()
             frm, to = clean_num(d.get("from", "")), clean_num(d.get("to", ""))
             fn = safe_name(str(d.get("file", "")))
@@ -511,64 +721,114 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "from/to/file requeridos"}, 400)
             if frm == to:
                 return self._json({"ok": False, "error": "no puedes enviarte a ti mismo"}, 400)
-            if not (ARCHIVOS / fn).is_file():
-                return self._json({"ok": False, "error": "archivo no existe"}, 404)
-            offers = _load_json(OFFERS_FILE, [])
-            oid = str(int(time.time() * 1000))[-8:] + str(os.getpid())[-2:]
-            offers.append({"id": oid, "from": frm, "to": to, "file": fn,
-                           "status": "pendiente", "ts": time.time(),
-                           "fecha": datetime.now().strftime("%d/%m %H:%M")})
-            _save_json(OFFERS_FILE, offers[-300:])
+            with LOCK:
+                meta = _load_json(FILES_META, {})
+                if not (ARCHIVOS / fn).is_file():
+                    return self._json({"ok": False, "error": "archivo no existe"}, 404)
+                if meta.get(fn, {}).get("from") != frm:
+                    return self._json({"ok": False, "error": "ese archivo no es tuyo"}, 403)
+                offers = _load_json(OFFERS_FILE, [])
+                for o in offers:
+                    if (o.get("file") == fn and o.get("from") == frm
+                            and o.get("to") == to and o.get("status") == "pendiente"):
+                        return self._json({"ok": True, "id": o["id"], "repetida": True})
+                pend = sum(1 for o in offers
+                           if o.get("from") == frm and o.get("status") == "pendiente")
+                if pend >= MAX_OFFERS_PER_USER:
+                    return self._json(
+                        {"ok": False,
+                         "error": f"límite: {MAX_OFFERS_PER_USER} peticiones pendientes"},
+                        429)
+                oid = secrets.token_hex(4)
+                offers.append({"id": oid, "from": frm, "to": to, "file": fn,
+                               "status": "pendiente", "ts": time.time(),
+                               "fecha": datetime.now().strftime("%d/%m %H:%M")})
+                _save_json(OFFERS_FILE, offers[-OFFERS_KEEP:])
             return self._json({"ok": True, "id": oid})
-        elif path.startswith("/api/offers/") and (path.endswith("/accept") or path.endswith("/reject")):
+
+        if path.startswith("/api/offers/") and (path.endswith("/accept") or path.endswith("/reject")):
             oid = path[len("/api/offers/"):].rsplit("/", 1)[0]
             d = self._body_json()
             me = clean_num(d.get("user", ""))
-            offers = _load_json(OFFERS_FILE, [])
-            ok = False
-            for o in offers:
-                if o.get("id") == oid and o.get("to") == me and o.get("status") == "pendiente":
-                    o["status"] = "aceptada" if path.endswith("/accept") else "rechazada"
-                    ok = True
-            _save_json(OFFERS_FILE, offers[-300:])
+            aceptar = path.endswith("/accept")
+            with LOCK:
+                offers = _load_json(OFFERS_FILE, [])
+                ok = False
+                for o in offers:
+                    if o.get("id") == oid and o.get("to") == me and o.get("status") == "pendiente":
+                        o["status"] = "aceptada" if aceptar else "rechazada"
+                        ok = True
+                if ok:
+                    _save_json(OFFERS_FILE, offers[-OFFERS_KEEP:])
             return self._json({"ok": ok})
-        else:
-            self.send_error(404)
 
-    def do_DELETE(self):
-        p = urllib.parse.urlparse(self.path).path
-        if p.startswith("/api/files/"):
-            name = safe_name(urllib.parse.unquote(p[len("/api/files/"):]))
-            fp = ARCHIVOS / name
-            if fp.is_file():
-                fp.unlink()
-                return self._json({"ok": True})
-            return self._json({"ok": False}, 404)
         self.send_error(404)
+
+    # ---------- DELETE ----------
+    def do_DELETE(self):
+        u = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(u.query)
+        if not u.path.startswith("/api/files/"):
+            return self.send_error(404)
+        name = safe_name(urllib.parse.unquote(u.path[len("/api/files/"):]))
+        by = clean_num(qs.get("by", [""])[0])
+        with LOCK:
+            meta = _load_json(FILES_META, {})
+            owner = meta.get(name, {}).get("from", "")
+            if not by or by != owner:
+                return self._json({"ok": False, "error": "solo el dueño puede borrarlo"}, 403)
+            fp = ARCHIVOS / name
+            if not fp.is_file():
+                return self._json({"ok": False, "error": "no existe"}, 404)
+            fp.unlink(missing_ok=True)
+            meta.pop(name, None)
+            _save_json(FILES_META, meta)
+            offers = _load_json(OFFERS_FILE, [])
+            for o in offers:
+                if o.get("file") == name and o.get("status") in ("pendiente", "aceptada"):
+                    o["status"] = "cancelada"
+            _save_json(OFFERS_FILE, offers[-OFFERS_KEEP:])
+        return self._json({"ok": True})
 
 
 def main():
-    global ARCHIVOS
     ap = argparse.ArgumentParser(description="Papu-LAN: archivos en red local")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--dir", default=str(ARCHIVOS))
+    ap.add_argument("--dir", default=None, help="carpeta de archivos (default ./archivos)")
+    ap.add_argument("--data", default=None, help="carpeta de metadatos (default ./data)")
+    ap.add_argument("--ip", default=None, help="IP que se muestra a los demas")
     a = ap.parse_args()
-    ARCHIVOS = Path(a.dir).resolve()
-    ARCHIVOS.mkdir(parents=True, exist_ok=True)
-    srv = HTTPServer(("0.0.0.0", a.port), Handler)
-    ip = get_lan_ip()
+
+    init_dirs(a.dir, a.data)
+    ip = get_lan_ip(a.ip)
+    threading.Thread(target=_sweep_loop, daemon=True).start()
+
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", a.port), Handler)
+    except OSError as e:
+        print(f"No se pudo abrir el puerto {a.port}: {e}")
+        print("Prueba con otro: python3 app.py --port 8080")
+        return 1
+
     print("=" * 50)
-    print("  📁 Papu-LAN funcionando")
-    print(f"  👉 Este equipo : http://localhost:{a.port}")
-    print(f"  👉 Red local   : http://{ip}:{a.port}")
-    print(f"  📂 Carpeta     : {ARCHIVOS}")
-    print("  Pulsa Ctrl+C para detener")
+    print("  PAPU-LAN funcionando")
+    print(f"  Este equipo : http://localhost:{a.port}")
+    print(f"  Red local   : http://{ip}:{a.port}")
+    otras = [x for x in all_lan_ips() if x != ip]
+    for x in otras:
+        print(f"  Tambien     : http://{x}:{a.port}")
+    print(f"  Carpeta     : {ARCHIVOS}")
+    print(f"  Datos       : {DATA}")
+    print("  Ctrl+C para detener")
     print("=" * 50)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\nPapu-LAN detenido.")
+    finally:
+        srv.server_close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

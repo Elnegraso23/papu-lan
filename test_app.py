@@ -3,6 +3,7 @@
 import http.client
 import json
 import socket
+import os
 import tempfile
 import threading
 import time
@@ -274,6 +275,95 @@ class TestConcurrencia(Base):
         finally:
             s.close()
             time.sleep(0.3)   # deja terminar al hilo del cliente lento
+
+
+class TestArreglos(Base):
+    def _subida_cortada(self, enviados=5000, prometidos=100000):
+        """Manda solo parte del cuerpo y cierra, como un celular que pierde el Wi-Fi."""
+        body = (f"--{BOUND}\r\nContent-Disposition: form-data; name=\"f\"; "
+                f"filename=\"tarea.pdf\"\r\n\r\n").encode() + b"A" * enviados
+        hdr = (f"POST /api/upload?from=111 HTTP/1.1\r\nHost: x\r\n"
+               f"Content-Type: multipart/form-data; boundary={BOUND}\r\n"
+               f"Content-Length: {len(body) + prometidos}\r\n\r\n").encode()
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall(hdr + body)
+        s.shutdown(socket.SHUT_WR)
+        s.settimeout(5)
+        try:
+            return s.recv(4096)
+        finally:
+            s.close()
+
+    def test_subida_cortada_no_deja_hilo_en_ciclo(self):
+        antes = threading.active_count()
+        resp = self._subida_cortada()
+        self.assertIn(b"400", resp.split(b"\r\n", 1)[0])
+        self.assertTrue(self.esperar(lambda: threading.active_count() <= antes),
+                        "el hilo de la subida cortada sigue vivo")
+
+    def test_subida_cortada_no_guarda_archivo_truncado(self):
+        self._subida_cortada()
+        self.assertTrue(self.esperar(lambda: not any(app.ARCHIVOS.iterdir())),
+                        f"quedaron archivos: {list(app.ARCHIVOS.iterdir())}")
+        self.assertEqual(app._load_json(app.FILES_META, None), {})
+
+    def test_subida_cortada_borra_tambien_las_partes_completas(self):
+        completo = (f"--{BOUND}\r\nContent-Disposition: form-data; name=\"f\"; "
+                    f"filename=\"uno.txt\"\r\n\r\nhola\r\n").encode()
+        cortado = (f"--{BOUND}\r\nContent-Disposition: form-data; name=\"f\"; "
+                   f"filename=\"dos.txt\"\r\n\r\nmedio").encode()
+        body = completo + cortado
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall((f"POST /api/upload?from=111 HTTP/1.1\r\nHost: x\r\n"
+                   f"Content-Type: multipart/form-data; boundary={BOUND}\r\n"
+                   f"Content-Length: {len(body) + 5000}\r\n\r\n").encode() + body)
+        s.shutdown(socket.SHUT_WR)
+        s.settimeout(5)
+        s.recv(4096)
+        s.close()
+        self.assertTrue(self.esperar(lambda: not self.visibles()))
+
+    def test_subida_enorme_se_rechaza_sin_escribir(self):
+        app.MAX_UPLOAD_BYTES, viejo = 10_000, app.MAX_UPLOAD_BYTES
+        try:
+            s = socket.create_connection(("127.0.0.1", self.port))
+            s.sendall(b"POST /api/upload?from=111 HTTP/1.1\r\nHost: x\r\n"
+                      b"Content-Type: multipart/form-data; boundary=BB\r\n"
+                      b"Content-Length: 50000000000\r\n\r\n--BB\r\n")
+            s.settimeout(5)
+            resp = s.recv(4096)
+            s.close()
+            self.assertIn(b"413", resp.split(b"\r\n", 1)[0])
+            self.assertEqual(list(app.ARCHIVOS.iterdir()), [])
+        finally:
+            app.MAX_UPLOAD_BYTES = viejo
+
+    def test_limpieza_borra_huerfanos_viejos(self):
+        viejo = app.ARCHIVOS / "huerfano.bin"
+        nuevo = app.ARCHIVOS / "recien.bin"
+        viejo.write_bytes(b"x")
+        nuevo.write_bytes(b"x")
+        t = time.time() - app.ORPHAN_SECS - 5
+        os.utime(viejo, (t, t))
+        app._sweep()
+        self.assertFalse(viejo.exists(), "el huerfano viejo no se borro")
+        self.assertTrue(nuevo.exists(), "no debe borrar un archivo recien subido")
+
+    def test_limpieza_respeta_archivos_con_metadatos(self):
+        self.subir([("mio.txt", b"x")], frm="111")
+        f = app.ARCHIVOS / "mio.txt"
+        t = time.time() - app.ORPHAN_SECS - 5
+        os.utime(f, (t, t))
+        app._sweep()
+        self.assertTrue(f.exists())
+
+    def test_info_usa_la_ip_forzada(self):
+        app.SHOW_IP, viejo = "10.9.8.7", app.SHOW_IP
+        try:
+            st, js, _, _ = self.req("GET", "/api/info")
+            self.assertEqual(js["ip"], "10.9.8.7")
+        finally:
+            app.SHOW_IP = viejo
 
 
 class TestSeguridad(Base):

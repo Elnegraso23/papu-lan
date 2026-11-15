@@ -40,6 +40,9 @@ MAX_NAME_LEN = 120           # largo maximo del nombre de archivo
 MAX_JSON_BYTES = 64 * 1024   # tope del cuerpo JSON de las peticiones
 SWEEP_SECS = 60              # cada cuanto corre la limpieza
 OFFERS_KEEP = 300            # peticiones que se conservan en el historial
+ORPHAN_SECS = 600            # archivo sin metadatos: se borra tras 10 min
+MAX_UPLOAD_BYTES = MAX_BYTES * MAX_FILES_PER_USER + 1024 * 1024  # tope de una subida
+SHOW_IP = None               # IP forzada con --ip (se muestra en la pagina)
 
 # Un solo candado para todos los JSON: las escrituras son criticas y cortas.
 LOCK = threading.RLock()
@@ -147,6 +150,15 @@ def _sweep():
                     dirty_m = True
             if dirty_m:
                 _save_json(FILES_META, meta)
+            # archivos en disco sin metadatos (p. ej. subidas que fallaron a medias)
+            for f in ARCHIVOS.iterdir():
+                if f.name.startswith(".") or f.name in meta or not f.is_file():
+                    continue
+                try:
+                    if now - f.stat().st_mtime > ORPHAN_SECS:
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
             # restos de subidas interrumpidas
             for t in ARCHIVOS.glob(".subiendo_*.part"):
                 try:
@@ -226,6 +238,10 @@ def fmt_size(n):
     return f"{n:.1f} TB"
 
 
+class SubidaIncompleta(Exception):
+    """El cliente corto la conexion antes de terminar de mandar el archivo."""
+
+
 class _Multipart:
     """Lector multipart en streaming: nunca carga el cuerpo completo en memoria."""
 
@@ -276,10 +292,11 @@ class _Multipart:
                 size += len(chunk)
                 self.buf = self.buf[-keep:]
             if not self._fill():
-                fh.write(self.buf)
-                size += len(self.buf)
-                self.buf = b""
-                return size
+                # Se acabaron los datos sin llegar al separador: la subida
+                # se corto (celular sin Wi-Fi, pestana cerrada...). Antes se
+                # guardaba el archivo truncado y el ciclo de parts() no
+                # terminaba nunca.
+                raise SubidaIncompleta()
 
     def parts(self):
         """Genera (filename, size, tmp_path) escribiendo cada parte a disco."""
@@ -305,8 +322,12 @@ class _Multipart:
             tmp = tempfile.NamedTemporaryFile(
                 delete=False, dir=str(ARCHIVOS), prefix=".subiendo_", suffix=".part"
             )
-            with tmp:
-                size = self._body_to(tmp)
+            try:
+                with tmp:
+                    size = self._body_to(tmp)
+            except BaseException:
+                Path(tmp.name).unlink(missing_ok=True)
+                raise
             yield fn, size, Path(tmp.name)
             if self.buf.startswith(b"--"):
                 return
@@ -561,7 +582,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
         elif path == "/api/info":
-            self._json({"ip": get_lan_ip(), "port": self.server.server_port,
+            self._json({"ip": get_lan_ip(SHOW_IP), "port": self.server.server_port,
                         "host": socket.gethostname()})
 
         elif path == "/api/files":
@@ -657,6 +678,12 @@ class Handler(BaseHTTPRequestHandler):
                 length = 0
             if length <= 0:
                 return self._json({"ok": False, "error": "Content-Length requerido"}, 411)
+            if length > MAX_UPLOAD_BYTES:
+                # No se lee el cuerpo: se corta la conexion para no llenar el disco.
+                self.close_connection = True
+                return self._json(
+                    {"ok": False, "error": f"subida demasiado grande (máx. {MAX_FILE_MB} MB por archivo)"},
+                    413)
 
             mp = _Multipart(self.rfile, boundary, length)
             pendientes, rechazados, motivos = [], [], []
@@ -685,9 +712,12 @@ class Handler(BaseHTTPRequestHandler):
                             tmp.unlink(missing_ok=True)
                             raise
                     pendientes.append(dest)
-            except Exception:
+            except Exception as e:
                 for d in pendientes:
                     d.unlink(missing_ok=True)
+                self.close_connection = True
+                if isinstance(e, SubidaIncompleta):
+                    return self._json({"ok": False, "error": "la subida se interrumpió"}, 400)
                 return self._json({"ok": False, "error": "cuerpo multipart inválido"}, 400)
 
             saved = []
@@ -799,6 +829,8 @@ def main():
     ap.add_argument("--ip", default=None, help="IP que se muestra a los demas")
     a = ap.parse_args()
 
+    global SHOW_IP
+    SHOW_IP = a.ip
     init_dirs(a.dir, a.data)
     ip = get_lan_ip(a.ip)
     threading.Thread(target=_sweep_loop, daemon=True).start()

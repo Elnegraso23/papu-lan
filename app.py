@@ -40,6 +40,9 @@ MAX_NAME_LEN = 120           # largo maximo del nombre de archivo
 MAX_JSON_BYTES = 64 * 1024   # tope del cuerpo JSON de las peticiones
 SWEEP_SECS = 60              # cada cuanto corre la limpieza
 OFFERS_KEEP = 300            # peticiones que se conservan en el historial
+ORPHAN_SECS = 600            # archivo sin metadatos: se borra tras 10 min
+MAX_UPLOAD_BYTES = MAX_BYTES * MAX_FILES_PER_USER + 1024 * 1024  # tope de una subida
+SHOW_IP = None               # IP forzada con --ip (se muestra en la pagina)
 
 # Un solo candado para todos los JSON: las escrituras son criticas y cortas.
 LOCK = threading.RLock()
@@ -147,6 +150,15 @@ def _sweep():
                     dirty_m = True
             if dirty_m:
                 _save_json(FILES_META, meta)
+            # archivos en disco sin metadatos (p. ej. subidas que fallaron a medias)
+            for f in ARCHIVOS.iterdir():
+                if f.name.startswith(".") or f.name in meta or not f.is_file():
+                    continue
+                try:
+                    if now - f.stat().st_mtime > ORPHAN_SECS:
+                        f.unlink(missing_ok=True)
+                except Exception:
+                    pass
             # restos de subidas interrumpidas
             for t in ARCHIVOS.glob(".subiendo_*.part"):
                 try:
@@ -226,6 +238,10 @@ def fmt_size(n):
     return f"{n:.1f} TB"
 
 
+class SubidaIncompleta(Exception):
+    """El cliente corto la conexion antes de terminar de mandar el archivo."""
+
+
 class _Multipart:
     """Lector multipart en streaming: nunca carga el cuerpo completo en memoria."""
 
@@ -276,10 +292,11 @@ class _Multipart:
                 size += len(chunk)
                 self.buf = self.buf[-keep:]
             if not self._fill():
-                fh.write(self.buf)
-                size += len(self.buf)
-                self.buf = b""
-                return size
+                # Se acabaron los datos sin llegar al separador: la subida
+                # se corto (celular sin Wi-Fi, pestana cerrada...). Antes se
+                # guardaba el archivo truncado y el ciclo de parts() no
+                # terminaba nunca.
+                raise SubidaIncompleta()
 
     def parts(self):
         """Genera (filename, size, tmp_path) escribiendo cada parte a disco."""
@@ -305,8 +322,12 @@ class _Multipart:
             tmp = tempfile.NamedTemporaryFile(
                 delete=False, dir=str(ARCHIVOS), prefix=".subiendo_", suffix=".part"
             )
-            with tmp:
-                size = self._body_to(tmp)
+            try:
+                with tmp:
+                    size = self._body_to(tmp)
+            except BaseException:
+                Path(tmp.name).unlink(missing_ok=True)
+                raise
             yield fn, size, Path(tmp.name)
             if self.buf.startswith(b"--"):
                 return
@@ -383,6 +404,21 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 .coco:nth-of-type(3){animation-delay:.15s}.coco:nth-of-type(4){animation-delay:.3s}.coco:nth-of-type(5){animation-delay:.45s}.coco:nth-of-type(6){animation-delay:.6s}
 @keyframes avanza{0%{transform:translateX(0);opacity:1}80%{opacity:1}100%{transform:translateX(-46px);opacity:0}}
 .sticker{display:inline-block;background:#000;color:#fff;border-top:3px solid var(--acc2);border-bottom:3px solid var(--acc2);padding:4px 14px;font-weight:900;font-size:13px;letter-spacing:2px;font-family:"Arial Black",Arial,sans-serif}
+[hidden]{display:none!important}
+main{max-width:1200px}
+.cols{display:grid;gap:16px}
+.col{display:grid;gap:16px;align-content:start;scroll-margin-top:96px}
+.cnt{font-style:normal}
+.me{flex-wrap:wrap}.me #meinfo{flex:1 1 100%;min-width:0}.me button{flex:1 1 auto}
+.fila .acc{flex-wrap:wrap}
+.fila .para{flex:1 1 100%;min-width:0;padding:10px}
+.fila .acc button{flex:1;min-height:44px;padding:10px 14px}
+@media(min-width:760px){.me #meinfo{flex:1 1 auto}.me button{flex:none}.fila .n{flex:1;min-width:0}.fila .s{flex:none;white-space:nowrap}.fila .para{flex:0 0 150px}.fila .acc button{flex:none}}
+#pac{margin:12px 0 0}
+#saltos{position:fixed;left:0;right:0;bottom:0;z-index:20;display:flex;gap:10px;background:#000;border-top:4px solid var(--acc2);padding:10px 16px;padding-bottom:calc(10px + env(safe-area-inset-bottom))}
+#saltos button{flex:1;min-height:48px;padding:10px}
+body{padding-bottom:calc(84px + env(safe-area-inset-bottom))}
+@media(min-width:900px){.cols{grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:20px}#saltos{display:none}body{padding-bottom:env(safe-area-inset-bottom)}}
 </style>
 </head>
 <body>
@@ -401,98 +437,150 @@ select{width:100%;background:#000;border:2px solid #4a4a4a;color:var(--txt);bord
 <div class="row"><button onclick="entrar()">ENTRAR</button></div>
 </div></div>
 <main>
-<div class="pacstrip"><div class="pacman"></div><div class="coco"></div><div class="coco"></div><div class="coco"></div><div class="coco"></div><div class="coco"></div><span style="font-size:12px;letter-spacing:1px">TRANSFIRIENDO EN LA RED LOCAL</span></div>
-<div class="me"><span id="meinfo">Sin sesion</span><button class="ghost" onclick="salir()">SALIR</button></div>
-<div class="card"><h2>CONEXION EN EL LABORATORIO</h2>
+<div class="me"><span id="meinfo">Sin sesion</span>
+<button class="ghost" id="btnNum" onclick="copiarNumero()">COPIAR MI NÚMERO</button>
+<button class="ghost" onclick="toggleConn()">DIRECCIÓN</button>
+<button class="ghost" onclick="salir()">SALIR</button></div>
+<div class="card" id="conexion" hidden><h2>CONEXION EN EL LABORATORIO</h2>
 <div class="conn" id="conn">Cargando dirección local…</div>
-<button class="ghost copy" onclick="copiar()">COPIAR DIRECCION</button>
+<div class="row"><button class="ghost" id="btnCopiar" onclick="copiar()">COPIAR DIRECCION</button><button class="ghost" onclick="toggleConn()">CERRAR</button></div>
 <p style="color:var(--mut);font-size:13px;margin-top:8px">Mismo Wi-Fi del laboratorio: abre la direccion en tu celular y pon tu numero de usuario.</p>
 </div>
-<div class="card"><h2>1. SUBE EL ARCHIVO QUE QUIERES MANDAR</h2>
+<div class="cols">
+<section class="col" id="sec-enviar">
+<div class="card"><h2>ENVIAR ARCHIVO</h2>
 <p style="font-size:12px;color:var(--mut);margin-bottom:8px">Limite: <b>100 MB</b> por archivo · <b>10</b> archivos por usuario · se borra solo al descargar o en <b>2 horas</b> · la peticion expira en <b>30 min</b>.</p>
 <div id="drop">Arrastra archivos aquí o elígelos abajo</div>
 <input type="file" id="file" multiple>
-<div class="row"><button onclick="subir()">SUBIR ARCHIVOS</button></div>
+<label for="dest">Para (numero de usuario)</label>
+<p style="font-size:12px;color:var(--mut);margin-bottom:6px">Opcional: si lo dejas vacío, el archivo solo se sube y lo mandas después desde MIS ARCHIVOS.</p>
+<input id="dest" placeholder="Numero del destinatario (ej. 2024015)" maxlength="20" inputmode="numeric">
+<div class="row"><button id="btnSubir" onclick="subir()">SUBIR</button></div>
+<div class="pacstrip" id="pac" hidden><div class="pacman"></div><div class="coco"></div><div class="coco"></div><div class="coco"></div><div class="coco"></div><div class="coco"></div><span style="font-size:12px;letter-spacing:1px">TRANSFIRIENDO EN LA RED LOCAL</span></div>
 <p id="st" style="font-size:13px;color:var(--mut);margin-top:8px"></p></div>
-<div class="grid2">
-<div class="card"><h2>2. MANDA LA PETICION</h2>
-<label style="font-size:13px;color:var(--mut)">Archivo</label>
-<select id="selFile" style="margin:6px 0 10px"></select>
-<label style="font-size:13px;color:var(--mut)">Para (numero de usuario)</label>
-<input id="dest" placeholder="Numero del destinatario (ej. 2024015)" style="margin:6px 0 10px" maxlength="20" inputmode="numeric">
-<div class="row"><button onclick="pedir()">ENVIAR PETICION DE INTERCAMBIO</button></div>
-<p id="st2" style="font-size:13px;color:var(--mut);margin-top:8px"></p></div>
-</div>
-<div class="card"><h2>MIS ARCHIVOS EN EL SERVIDOR</h2>
+<div class="card"><h2>MIS ARCHIVOS EN EL SERVIDOR <em class="cnt" id="nfiles"></em></h2>
 <div id="mine">—</div>
+<p id="st3" style="font-size:13px;color:var(--mut);margin-top:8px"></p>
 <p style="color:var(--mut);font-size:12px;margin-top:8px">Se borran solos al descargarlos o a las 2 h.</p></div>
-<div class="card"><h2>PETICIONES PARA TI <span style="font-size:12px;color:var(--mut)">(acepta para iniciar la transferencia)</span></h2><div id="inbox">—</div></div>
+</section>
+<section class="col" id="sec-recibir">
+<div class="card"><h2>PETICIONES PARA TI <em class="cnt" id="npend"></em><span style="font-size:12px;color:var(--mut)">(acepta para iniciar la transferencia)</span></h2><div id="inbox">—</div></div>
 <div class="card"><h2>TUS PETICIONES ENVIADAS</h2><div id="outbox">—</div></div>
+</section>
+</div>
 </main>
+<nav id="saltos"><button class="ghost" onclick="ir('sec-enviar')">ENVIAR</button><button onclick="ir('sec-recibir')">RECIBIR<span id="jumpN"></span></button></nav>
 <footer>PAPU-LAN · <span class="sticker">SEGUIDORES DE LA GRASA</span> · practica de Sistemas Operativos · red local</footer>
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let YO=localStorage.getItem('papu_num')||'',NOMBRE=localStorage.getItem('papu_nom')||'',FILES=[],OFFERS=[];
-function badge(txt,ok){const b=document.getElementById('badge');if(!b)return;b.textContent=txt;b.style.background=ok?'var(--acc2)':'#3a3a3a';b.style.color=ok?'#fff':'var(--mut)'}
-async function entrar(){const n=document.getElementById('linum').value.trim();if(!n){alert('Pon tu número de usuario');return}
-const nm=document.getElementById('linom').value.trim();
+let YO=localStorage.getItem('papu_num')||'',NOMBRE=localStorage.getItem('papu_nom')||'',FILES=[],OFFERS=[],ENVIANDO=null;
+const $=id=>document.getElementById(id);
+function badge(txt,ok){const b=$('badge');if(!b)return;b.textContent=txt;b.style.background=ok?'var(--acc2)':'#3a3a3a';b.style.color=ok?'#fff':'var(--mut)'}
+async function entrar(){const n=$('linum').value.trim();if(!n){alert('Pon tu número de usuario');return}
+const nm=$('linom').value.trim();
 const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({numero:n,nombre:nm})});
 const d=await r.json();if(!d.ok){alert('No se pudo entrar');return}
 YO=d.numero;NOMBRE=d.nombre||nm;localStorage.setItem('papu_num',YO);localStorage.setItem('papu_nom',NOMBRE);
 verSesion();cargarTodo()}
 function salir(){localStorage.removeItem('papu_num');localStorage.removeItem('papu_nom');YO='';NOMBRE='';verSesion()}
-function verSesion(){document.getElementById('login').style.display=YO?'none':'flex';
-document.getElementById('meinfo').textContent=YO?('USUARIO '+YO+(NOMBRE?' · '+NOMBRE:'')):'Sin sesión';
-if(YO){document.getElementById('linum').value=YO;document.getElementById('linom').value=NOMBRE||''}}
+function verSesion(){$('login').style.display=YO?'none':'flex';
+$('meinfo').textContent=YO?('USUARIO '+YO+(NOMBRE?' · '+NOMBRE:'')):'Sin sesión';
+if(YO){$('linum').value=YO;$('linom').value=NOMBRE||''}}
 async function cargarTodo(){verSesion();if(!YO)return;cargarFiles();cargarConn();cargarOffers()}
 async function cargarConn(){try{const r=await fetch('/api/info');const d=await r.json();
 window._url='http://'+d.ip+':'+d.port;
-document.getElementById('conn').innerHTML='En tu celular abre:<br><b>'+esc(window._url)+'</b><br><span style="color:var(--mut);font-size:12px">'+esc(d.host)+'</span>'}catch(e){badge('SIN CONEXIÓN',false)}}
-function avisoCopiado(){const b=document.querySelector('.copy');if(!b)return;const t=b.textContent;b.textContent='✓ DIRECCIÓN COPIADA';setTimeout(()=>{b.textContent=t},1600)}
-function copiar(){const url=window._url||'';
-const manual=()=>{try{const ta=document.createElement('textarea');ta.value=url;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.top='-1000px';document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,99999);const ok=document.execCommand('copy');document.body.removeChild(ta);if(ok){avisoCopiado();return}}catch(e){}
-if(url){prompt('Copia la dirección:',url)}};
-if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(url).then(avisoCopiado,manual);return}
+$('conn').innerHTML='En tu celular abre:<br><b>'+esc(window._url)+'</b><br><span style="color:var(--mut);font-size:12px">'+esc(d.host)+'</span>'}catch(e){badge('SIN CONEXIÓN',false)}}
+function avisar(btn,txt){if(!btn)return;const t=btn.dataset.t||btn.textContent;btn.dataset.t=t;btn.textContent=txt;setTimeout(()=>{btn.textContent=t},1600)}
+function copiarTexto(txt,btn,ok){
+const manual=()=>{try{const ta=document.createElement('textarea');ta.value=txt;ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.top='-1000px';document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,99999);const r=document.execCommand('copy');document.body.removeChild(ta);if(r){avisar(btn,ok);return}}catch(e){}
+if(txt){prompt('Copia:',txt)}};
+if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(txt).then(()=>avisar(btn,ok),manual);return}
 manual()}
+function copiar(){copiarTexto(window._url||'',$('btnCopiar'),'✓ DIRECCIÓN COPIADA')}
+function copiarNumero(){copiarTexto(YO,$('btnNum'),'✓ COPIADO')}
+function toggleConn(){const c=$('conexion');c.hidden=!c.hidden;if(!c.hidden){cargarConn();c.scrollIntoView({behavior:'smooth',block:'start'})}}
+function ir(id){$(id).scrollIntoView({behavior:'smooth',block:'start'})}
+function textoBoton(){const t=$('dest').value.trim();$('btnSubir').textContent=t?('SUBIR Y ENVIAR A '+t):'SUBIR'}
+async function crearPeticion(file,to){
+const r=await fetch('/api/offers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:YO,to:to,file:file})});
+return r.json()}
 async function cargarFiles(){if(!YO)return;try{const r=await fetch('/api/files?user='+encodeURIComponent(YO));FILES=await r.json();
-document.getElementById('selFile').innerHTML=FILES.map(f=>`<option value="${esc(f.name)}">${esc(f.name)} (${esc(f.size_h)})</option>`).join('')||'<option value="">(sube un archivo primero)</option>';
-document.getElementById('mine').innerHTML=FILES.length?FILES.map((f,i)=>`<div class="fila"><span class="ico">&#128196;</span><span class="n">${esc(f.name)}</span><span class="s">${esc(f.size_h)} · ${esc(f.date)}</span><div class="acc"><button class="danger" data-i="${i}">ELIMINAR</button></div></div>`).join(''):'<p style="color:var(--mut);font-size:13px">Aún no has subido archivos.</p>';badge('EN LÍNEA',true)}catch(e){badge('SIN CONEXIÓN',false)}}
+if(!(ENVIANDO&&FILES.some(f=>f.name===ENVIANDO)))pintarFiles();
+badge('EN LÍNEA',true)}catch(e){badge('SIN CONEXIÓN',false)}}
+function pintarFiles(){
+if(ENVIANDO&&!FILES.some(f=>f.name===ENVIANDO))ENVIANDO=null;
+$('nfiles').textContent=FILES.length?'('+FILES.length+'/10)':'';
+$('mine').innerHTML=FILES.length?FILES.map((f,i)=>`<div class="fila"><span class="ico">&#128196;</span><span class="n">${esc(f.name)}</span><span class="s">${esc(f.size_h)} · ${esc(f.date)}</span><div class="acc">`+
+(ENVIANDO===f.name
+?`<input class="para" placeholder="Para (número)" maxlength="20" inputmode="numeric"><button data-a="mandar" data-i="${i}">MANDAR</button><button class="ghost" data-a="cerrar">CANCELAR</button>`
+:`<button data-a="enviar" data-i="${i}">ENVIAR</button><button class="danger" data-a="borrar" data-i="${i}">ELIMINAR</button>`)+
+`</div></div>`).join(''):'<p style="color:var(--mut);font-size:13px">Aún no has subido archivos.</p>'}
+async function mandarDesdeLista(){const inp=document.querySelector('#mine .para');const t=inp?inp.value.trim():'';const st=$('st3');
+if(!t){alert('Escribe el número destino');return}
+const d=await crearPeticion(ENVIANDO,t);
+st.style.color=d.ok?'var(--mut)':'#ff8080';
+st.textContent=d.ok?('Petición de '+ENVIANDO+' enviada a '+t+(d.repetida?' (ya existía)':'')):'Error: '+(d.error||'Error');
+if(d.ok){ENVIANDO=null;pintarFiles()}cargarOffers()}
 async function borrar(n){if(!confirm('¿Eliminar "'+n+'" del servidor?'))return;
 const r=await fetch('/api/files/'+encodeURIComponent(n)+'?by='+encodeURIComponent(YO),{method:'DELETE'});
 const d=await r.json();if(!d.ok)alert('No se pudo eliminar: '+(d.error||'error'));cargarFiles()}
-async function cargarOffers(){if(!YO)return;try{const r=await fetch('/api/offers?user='+encodeURIComponent(YO));OFFERS=await r.json();
+async function cargarOffers(){if(!YO)return;try{const r=await fetch('/api/offers?user='+encodeURIComponent(YO));OFFERS=await r.json();pintarOffers();badge('EN LÍNEA',true)}catch(e){badge('SIN CONEXIÓN',false)}}
+function linkDescarga(o,txt){return `<a href="/download/${encodeURIComponent(o.file)}?by=${encodeURIComponent(YO)}" style="flex:1;text-align:center;background:var(--acc);color:#000;font-family:Arial Black,Arial,sans-serif;text-decoration:none;border:3px solid #000;border-radius:8px;padding:13px">${txt}</a>`}
+function pintarOffers(){
 const inc=OFFERS.filter(o=>o.to===YO),out=OFFERS.filter(o=>o.from===YO);
-document.getElementById('inbox').innerHTML=inc.length?inc.map(o=>{
-if(o.status==='pendiente')return `<div class="off pend"><div class="t2">${esc(o.file)}</div><div class="d">De <b>${esc(o.from)}</b> · ${esc(o.fecha)} · pendiente tu respuesta</div><div class="btns"><button onclick="resp('${esc(o.id)}',true)">ACEPTAR E INICIAR TRANSFERENCIA</button><button class="ghost" onclick="resp('${esc(o.id)}',false)">RECHAZAR</button></div></div>`;
-if(o.status==='aceptada')return `<div class="off ok"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · aceptada · la transferencia está en curso</div><div class="btns"><a href="/download/${encodeURIComponent(o.file)}?by=${encodeURIComponent(YO)}" style="flex:1;text-align:center;background:var(--acc);color:#000;font-family:Arial Black,Arial,sans-serif;text-decoration:none;border:3px solid #000;border-radius:8px;padding:13px">DESCARGAR AHORA (SE BORRA AL DESCARGAR)</a></div></div>`;
+const pend=inc.filter(o=>o.status==='pendiente').length;
+$('npend').textContent=pend?'('+pend+')':'';
+$('jumpN').textContent=pend?' ('+pend+')':'';
+document.title=(pend?'('+pend+') ':'')+'PAPU-LAN · SDLG · Red local';
+$('inbox').innerHTML=inc.length?inc.map(o=>{
+if(o.status==='pendiente')return `<div class="off pend"><div class="t2">${esc(o.file)}</div><div class="d">De <b>${esc(o.from)}</b> · ${esc(o.fecha)} · pendiente tu respuesta</div><div class="btns"><button data-a="aceptar" data-id="${esc(o.id)}" data-file="${esc(o.file)}">ACEPTAR Y DESCARGAR</button><button class="ghost" data-a="rechazar" data-id="${esc(o.id)}">RECHAZAR</button></div></div>`;
+if(o.status==='aceptada')return `<div class="off ok"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · aceptada · la transferencia está en curso</div><div class="btns">${linkDescarga(o,'DESCARGAR AHORA (SE BORRA AL DESCARGAR)')}</div></div>`;
 if(o.status==='completada')return `<div class="off ok"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · ya se descargó y se borró del servidor</div></div>`;
 if(o.status==='expirada')return `<div class="off no"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · la petición expiró (30 min), pide que te la manden de nuevo</div></div>`;
 return `<div class="off no"><div class="t2">${esc(o.file)}</div><div class="d">De ${esc(o.from)} · ${esc(o.status)}</div></div>`}).join(''):'<p style="color:var(--mut)">Sin peticiones por ahora.</p>';
-document.getElementById('outbox').innerHTML=out.length?out.map(o=>{
+$('outbox').innerHTML=out.length?out.map(o=>{
 let extra=o.status==='aceptada'?` · <a href="/download/${encodeURIComponent(o.file)}?by=${encodeURIComponent(YO)}" style="color:var(--acc)">descargar</a>`:'';
-return `<div class="off ${o.status==='pendiente'?'pend':o.status==='aceptada'?'ok':'no'}"><div class="t2">${esc(String(o.status).toUpperCase())} · ${esc(o.file)}</div><div class="d">Para <b>${esc(o.to)}</b> · ${esc(o.fecha)}${extra}</div></div>`}).join(''):'<p style="color:var(--mut)">Aún no envías peticiones.</p>';badge('EN LÍNEA',true)}catch(e){badge('SIN CONEXIÓN',false)}}
-async function resp(id,ok){await fetch('/api/offers/'+encodeURIComponent(id)+(ok?'/accept':'/reject'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:YO})});cargarOffers()}
-async function pedir(){const f=document.getElementById('selFile').value;const t=document.getElementById('dest').value.trim();
-if(!YO){alert('Entra primero con tu número');return}if(!f){alert('Sube o elige un archivo');return}if(!t){alert('Escribe el número destino');return}
-const r=await fetch('/api/offers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:YO,to:t,file:f})});
-const d=await r.json();const st=document.getElementById('st2');
-st.textContent=d.ok?('Petición enviada a '+t+(d.repetida?' (ya existía)':'')):'Error: '+(d.error||'Error');
-st.style.color=d.ok?'var(--mut)':'#ff8080';cargarOffers()}
-async function subir(){const inp=document.getElementById('file');if(!inp.files.length){document.getElementById('st').textContent='Elige al menos un archivo.';return}
+const sigue=FILES.some(f=>f.name===o.file);
+const otra=(o.status==='expirada'||o.status==='rechazada')&&sigue&&!out.some(p=>p.file===o.file&&p.to===o.to&&p.status==='pendiente');
+const btn=otra?`<div class="btns"><button class="ghost" data-a="reenviar" data-file="${esc(o.file)}" data-to="${esc(o.to)}">REENVIAR</button></div>`:'';
+return `<div class="off ${o.status==='pendiente'?'pend':o.status==='aceptada'?'ok':'no'}"><div class="t2">${esc(String(o.status).toUpperCase())} · ${esc(o.file)}</div><div class="d">Para <b>${esc(o.to)}</b> · ${esc(o.fecha)}${extra}</div>${btn}</div>`}).join(''):'<p style="color:var(--mut)">Aún no envías peticiones.</p>'}
+async function resp(id,ok,file){
+const r=await fetch('/api/offers/'+encodeURIComponent(id)+(ok?'/accept':'/reject'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:YO})});
+const d=await r.json();
+if(ok&&d.ok){window.location.href='/download/'+encodeURIComponent(file)+'?by='+encodeURIComponent(YO);setTimeout(cargarOffers,1500)}
+else if(ok&&!d.ok){alert('No se pudo aceptar: la petición ya no está pendiente')}
+cargarOffers()}
+async function subir(){const inp=$('file');if(!inp.files.length){$('st').textContent='Elige al menos un archivo.';return}
 if(!YO){alert('Entra primero con tu número');return}
+const t=$('dest').value.trim();
+if(t&&t===YO){alert('No puedes enviarte a ti mismo');return}
 const fd=new FormData();for(const f of inp.files)fd.append('f',f,f.name);
-const st=document.getElementById('st');st.textContent='Subiendo…';st.style.color='var(--mut)';
+const st=$('st');st.textContent='Subiendo…';st.style.color='var(--mut)';$('pac').hidden=false;
 try{const r=await fetch('/api/upload?from='+encodeURIComponent(YO),{method:'POST',body:fd});
 const d=await r.json();
-st.style.color=d.ok?'var(--mut)':'#ff8080';
-st.textContent=(d.ok?('OK: '+d.saved.join(', ')):'Error: '+(d.error||'Error al subir'))+(d.aviso?' · '+d.aviso:'');badge('EN LÍNEA',true)}
+let msg=d.ok?('Subido: '+d.saved.join(', ')):'Error: '+(d.error||'Error al subir');
+if(d.ok&&t){const malos=[];for(const n of d.saved){const p=await crearPeticion(n,t);if(!p.ok)malos.push(n+' ('+(p.error||'error')+')')}
+msg+=malos.length?(' · No se pudo enviar: '+malos.join(', ')):(' · Petición enviada a '+t);cargarOffers()}
+if(d.aviso)msg+=' · '+d.aviso;
+st.style.color=d.ok?'var(--mut)':'#ff8080';st.textContent=msg;badge('EN LÍNEA',true)}
 catch(e){st.style.color='#ff8080';st.textContent='Error de red al subir';badge('SIN CONEXIÓN',false)}
-inp.value='';cargarFiles()}
-const drop=document.getElementById('drop');if(drop){
+$('pac').hidden=true;inp.value='';cargarFiles()}
+$('dest').addEventListener('input',textoBoton);
+const drop=$('drop');if(drop){
 ['dragover','dragenter'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add('over')}));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove('over')}));
-drop.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length){document.getElementById('file').files=ev.dataTransfer.files;subir()}})}
-document.getElementById('mine').addEventListener('click',ev=>{const b=ev.target.closest('button[data-i]');if(b)borrar(FILES[+b.dataset.i].name)});
+drop.addEventListener('drop',ev=>{if(ev.dataTransfer.files.length){$('file').files=ev.dataTransfer.files;subir()}})}
+$('mine').addEventListener('click',ev=>{const b=ev.target.closest('button[data-a]');if(!b)return;const a=b.dataset.a,f=FILES[+b.dataset.i];
+if(a==='borrar')return borrar(f.name);
+if(a==='enviar'){ENVIANDO=f.name;$('st3').textContent='';pintarFiles();const p=document.querySelector('#mine .para');if(p)p.focus();return}
+if(a==='cerrar'){ENVIANDO=null;pintarFiles();return}
+if(a==='mandar')mandarDesdeLista()});
+$('mine').addEventListener('keydown',ev=>{if(ev.key==='Enter'&&ev.target.classList.contains('para'))mandarDesdeLista()});
+$('inbox').addEventListener('click',ev=>{const b=ev.target.closest('button[data-a]');if(!b)return;
+if(b.dataset.a==='aceptar')resp(b.dataset.id,true,b.dataset.file);
+if(b.dataset.a==='rechazar')resp(b.dataset.id,false)});
+$('outbox').addEventListener('click',async ev=>{const b=ev.target.closest('button[data-a="reenviar"]');if(!b)return;
+const d=await crearPeticion(b.dataset.file,b.dataset.to);if(!d.ok)alert('No se pudo reenviar: '+(d.error||'error'));cargarOffers()});
 verSesion();if(YO)cargarTodo();setInterval(()=>{if(YO){cargarOffers();cargarFiles()}},5000);
 </script>
 </body>
@@ -561,7 +649,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
         elif path == "/api/info":
-            self._json({"ip": get_lan_ip(), "port": self.server.server_port,
+            self._json({"ip": get_lan_ip(SHOW_IP), "port": self.server.server_port,
                         "host": socket.gethostname()})
 
         elif path == "/api/files":
@@ -657,6 +745,12 @@ class Handler(BaseHTTPRequestHandler):
                 length = 0
             if length <= 0:
                 return self._json({"ok": False, "error": "Content-Length requerido"}, 411)
+            if length > MAX_UPLOAD_BYTES:
+                # No se lee el cuerpo: se corta la conexion para no llenar el disco.
+                self.close_connection = True
+                return self._json(
+                    {"ok": False, "error": f"subida demasiado grande (máx. {MAX_FILE_MB} MB por archivo)"},
+                    413)
 
             mp = _Multipart(self.rfile, boundary, length)
             pendientes, rechazados, motivos = [], [], []
@@ -685,9 +779,12 @@ class Handler(BaseHTTPRequestHandler):
                             tmp.unlink(missing_ok=True)
                             raise
                     pendientes.append(dest)
-            except Exception:
+            except Exception as e:
                 for d in pendientes:
                     d.unlink(missing_ok=True)
+                self.close_connection = True
+                if isinstance(e, SubidaIncompleta):
+                    return self._json({"ok": False, "error": "la subida se interrumpió"}, 400)
                 return self._json({"ok": False, "error": "cuerpo multipart inválido"}, 400)
 
             saved = []
@@ -799,6 +896,8 @@ def main():
     ap.add_argument("--ip", default=None, help="IP que se muestra a los demas")
     a = ap.parse_args()
 
+    global SHOW_IP
+    SHOW_IP = a.ip
     init_dirs(a.dir, a.data)
     ip = get_lan_ip(a.ip)
     threading.Thread(target=_sweep_loop, daemon=True).start()
